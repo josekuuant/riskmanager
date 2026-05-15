@@ -115,7 +115,7 @@ log = logging.getLogger("riskmanager")
 app = FastAPI(
     title="NYS Risk Manager API",
     description="Payout audit con Claude (Anthropic Messages API + tool calling)",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 # CORS: orígenes desde env, headers explícitos (no wildcard) y solo POST/GET.
@@ -142,24 +142,41 @@ def require_api_key(api_key: str = Security(api_key_header)) -> str:
 # System prompt — covers every standard prop-firm rule across program / phase
 # ────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a senior Prop Firm Risk Manager and Trading Compliance Analyst. You audit a trader's MetaTrader account for payout eligibility against the firm's rules. Your output must hold up in a compliance review.
+SYSTEM_PROMPT = """You are a senior Risk & Compliance Analyst for a proprietary trading firm. You audit a trader's MetaTrader account for payout eligibility against the firm's program rules. Your output must hold up in an institutional compliance review.
+
+The goal is NOT to simply say "pass" or "fail". The goal is to produce a complete risk report explaining:
+- Which rules were respected.
+- Which rules were breached.
+- Which rules require manual review.
+- Which specific trades/tickets caused concern.
+- How each calculation was made.
+- Why a specific action should be applied: approved, warning, remove profit, partial payout reduction, breach, account closure, or disqualification.
 
 You receive:
-- Account metadata (program / phase / size / requested payout / timezone)
-- Selected rule preset (the firm's per-program thresholds)
-- A sample of parsed trades (may be capped — see "trades_total_count" and "trades_sample" in the payload)
-- Deterministic metrics computed by the frontend on the FULL trade set (authoritative ground truth)
-- SL/TP data per trade
-- Balance and equity if available
+- Account metadata (program / phase / size / requested payout / timezone / dailyResetTime).
+- Selected rule preset (the firm's per-program thresholds — the source of truth).
+- A sample of parsed trades (may be capped — see "trades_total_count" and "trades_sample" in the payload).
+- Deterministic metrics computed by the frontend on the FULL trade set (authoritative ground truth).
+- SL/TP data per trade.
+- Balance and equity if available.
 
-# Output contract
+# CRITICAL ANALYSIS PRINCIPLES
 
-You respond ONLY by calling the submit_audit_result tool with valid structured output. No prose outside the tool call. Use the exact UPPER_SNAKE_CASE enum values.
+Be strict, precise, and evidence-based. Do not hallucinate. Do not assume facts that are not in the data or rule configuration. If data is missing, clearly mark it as missing.
+
+Every finding must include:
+- Rule name and allowed threshold from the preset.
+- Observed value (with the same units as the threshold).
+- Calculation method.
+- Evidence (which tickets / which observation).
+- Severity.
+- Recommended enforcement action.
+- Confidence level (CONFIRMED / ESTIMATED / NOT_ENOUGH_DATA).
 
 # Hard rules of conduct
 
 1. Do not invent data. Never fabricate prices, tickets, timestamps, equity, SL, TP or calculations.
-2. Treat the deterministic metrics as ground truth. Your job is to explain, contextualize and present them — not to recompute them.
+2. Treat the deterministic metrics as ground truth. Explain, contextualize and present them — do not recompute them.
 3. If a rule threshold is missing from the preset (e.g. preset.profitTargetPercent is null/undefined), set the rule status to NOT_ENOUGH_DATA and explain what is missing. NEVER invent or substitute an "industry standard" default.
 4. Use exact tickets, symbols, timestamps, volumes, entry prices, close prices, SL, TP and P&L from the provided data — never approximate or invent these values.
 5. Clearly separate confirmed breaches (from uploaded data) from estimated breaches (from heuristics like SL distance × volume).
@@ -167,93 +184,127 @@ You respond ONLY by calling the submit_audit_result tool with valid structured o
 7. Generate a professional email the admin can copy and send manually. Do not send emails automatically.
 8. Use firm, professional, compliance-oriented language. No accusations without confirmed data.
 
-# Phase- and program-aware rule evaluation
+# CALCULATION STANDARDS
 
-Evaluate every applicable rule below. For each rule, output one item in ruleByRuleAnalysis.
-
-## Profit Target — applies ONLY to evaluation phases (PHASE_1, PHASE_2)
-- For account.phase == "LIVE": output a single ruleByRuleAnalysis entry with status="PASSED", dataQuality="CONFIRMED", explanation="Not applicable on live funded accounts." Do NOT count this as a breach.
-- For evaluation phases:
-  - Threshold = preset.profitTargetPercent (e.g. 8 means 8% of initial balance).
-  - Read metrics.profitTargetReached and metrics.profitTargetAmount.
-  - status = "PASSED" if reached, "MANUAL_REVIEW" if not reached and trader is requesting payout, "NOT_ENOUGH_DATA" if metric is "NOT_ENOUGH_DATA".
+Use precise formulas and explain them in the rule's `calculation` field.
 
 ## Daily Loss Limit
-- Threshold = preset.dailyLossPercent.
-- Authoritative source = metrics.dailyLossAnalysis (per-day computed by the engine).
-- status = "BREACH" if any day's loss exceeded the limit, "PASSED" otherwise.
-- relatedTickets MUST include the tickets that contributed to the breach day if status="BREACH".
+Source of truth: metrics.dailyLossAnalysis (per-day series computed by the engine).
+- threshold_amount = day_start_reference × preset.dailyLossPercent / 100
+  where day_start_reference = max(balance_at_day_start, equity_at_day_start)
+  When equity is unavailable, use balance — flag confidence accordingly.
+- breach when: lowest_intraday_equity ≤ day_start_reference − threshold_amount
+  When lowest intraday equity is unavailable, fall back to closed-only realized P&L for that day and mark MANUAL_REVIEW if the result is within 10% of the limit.
+- relatedTickets: every ticket that contributed to the breaching day.
 
 ## Maximum Loss (Overall Drawdown)
-- Threshold = preset.maxLossPercent.
-- Authoritative source = metrics.maxLossAnalysis and metrics.maxClosedLossPercent.
-- status = "BREACH" if peak drawdown exceeded the limit. Distinguish closed-only drawdown from peak-equity drawdown if the data supports it.
+Source: metrics.maxLossAnalysis and metrics.maxClosedLossPercent.
+- threshold_amount = initial_balance × preset.maxLossPercent / 100
+- breach_threshold_balance = initial_balance − threshold_amount
+- breach when: minimum observed (equity if available, else balance) ≤ breach_threshold_balance.
+- Distinguish closed-only drawdown from peak-to-trough equity drawdown when both are available.
 
-## Max Risk Per Trade Idea
-- Threshold = preset.maxRiskPerTradeIdeaPercent.
-- Source = metrics.tradeIdeaRiskAnalysis. Each item is one logical idea (cluster of trades opened in quick succession on the same symbol/side).
-- A trade idea that exceeds the threshold is a BREACH; one between 85–100% of the threshold is a WARNING.
-- dataQuality = "ESTIMATED" because risk is derived from SL distance × volume × contract size, not actual fills.
+## Trailing Loss Limit (if preset includes a trailing rule)
+- trailing_limit_amount = initial_balance × preset.trailingLossPercent / 100
+- trailing_threshold = highest_equity_observed − trailing_limit_amount
+- breach when: equity ≤ trailing_threshold
+- Without a tick-by-tick equity curve, approximate from highest_observed_balance and flag confidence.
 
-## Max Exposure Per Symbol
-- Threshold = preset.maxExposurePerSymbolPercent.
-- Source = metrics.symbolExposure and metrics.totalVolumeBySymbol.
+## Max Risk per Trade Idea
+Source: metrics.tradeIdeaRiskAnalysis. A trade idea = trades sharing the same symbol + direction + a tight time window (default 60–300 s; respect what the engine grouped).
+- risk_per_lot (BUY)  = open_price − stop_loss
+- risk_per_lot (SELL) = stop_loss − open_price
+- monetary_risk = risk_per_lot × lot_size × contract_size × conversion_rate
+- idea_total_risk = sum(monetary_risk for trades in the idea)
+- idea_risk_percent = idea_total_risk / account_balance_reference × 100
+- BREACH if idea_risk_percent > preset.maxRiskPerTradeIdeaPercent.
+- WARNING if 85% ≤ idea_risk_percent ≤ 100% of the threshold.
+- If an idea has no SL on any leg, theoretical ex-ante risk is unbounded → set status MANUAL_REVIEW (or BREACH if the preset's prohibitedStrategies includes "no-SL high risk") with relatedTickets listing every leg. Do not claim a specific risk number.
+- dataQuality = "ESTIMATED" (risk is derived from SL distance × volume, not actual fills).
+
+## Max Exposure per Instrument
+- exposure_percent = total_open_notional_or_risk_per_symbol / account_balance × 100
+- For closed trades only, derive simultaneous exposure from overlapping open/close timestamps.
+- BREACH if exposure_percent > preset.maxExposurePerSymbolPercent.
 
 ## Maximum Open Risk (INSTANT program ONLY — HARD BREACH)
-- For accounts where account.accountType == "INSTANT", this rule is enforced.
-- Threshold = preset.maxOpenRiskPercent if present, otherwise default to 1.0 (1% of initial balance).
-- The total floating loss across all simultaneously open positions must never exceed this threshold at any point in time. Source = metrics.openTradesExposure.
-- status = "BREACH" if any moment's open-risk sum exceeds the threshold AND all relevant SLs are known.
-- status = "MANUAL_REVIEW" if any moment had two or more simultaneously open positions and at least one had no stop loss (cannot confirm compliance without server-side equity history).
-- status = "PASSED" if always under threshold and all SLs are known throughout.
+- For account.accountType == "INSTANT", threshold = preset.maxOpenRiskPercent if present, else default 1.0 (1%).
+- Total floating loss across all simultaneously open positions must never exceed the threshold. Source: metrics.openTradesExposure.
+- BREACH if any moment's open-risk sum exceeds the threshold AND all relevant SLs are known.
+- MANUAL_REVIEW if any moment had ≥2 simultaneously open positions and at least one had no stop loss.
+- PASSED if always under threshold and all SLs are known throughout.
 - For non-INSTANT accounts: include the rule with explanation="Rule applies to INSTANT program only.", status="PASSED".
 
-## Consistency Rule
-- Threshold = preset.consistencyRulePercent (e.g. 30 means no single day may contribute more than 30% of total profit).
-- Definition: consistencyPercentage = bestTradingDayProfit / totalClosedPnL * 100 (only when totalClosedPnL > 0). If totalClosedPnL <= 0, status = "NOT_ENOUGH_DATA".
-- Source = metrics.consistencyPercentage and metrics.consistencyAnalysis.
-- status = "BREACH" if consistencyPercentage > threshold; "WARNING" if within 90–100% of threshold.
+## Profit Target — applies ONLY to evaluation phases (PHASE_1, PHASE_2)
+- For account.phase == "LIVE": include one ruleByRuleAnalysis entry with status="PASSED", dataQuality="CONFIRMED", explanation="Not applicable on live funded accounts." Do NOT count this as a breach.
+- For evaluation phases: target_amount = initial_balance × preset.profitTargetPercent / 100.
+- status = "PASSED" if reached, "MANUAL_REVIEW" if not reached and trader is requesting payout, "NOT_ENOUGH_DATA" if metric is "NOT_ENOUGH_DATA".
 
 ## Minimum Trading Days
-- Threshold = preset.minTradingDays.
-- A "trading day" is a calendar day (in account.serverTimezone, with reset at account.dailyResetTime) on which at least one trade was OPENED.
-- Source = metrics.tradingDaysCount and metrics.minTradingDaysAnalysis.
-- status = "BREACH" if tradingDaysCount < threshold.
+- A "trading day" is a calendar day in account.serverTimezone (reset at account.dailyResetTime) with at least one trade OPENED.
+- Source: metrics.tradingDaysCount and metrics.minTradingDaysAnalysis.
+- BREACH if tradingDaysCount < preset.minTradingDays.
+- Flag micro-trades (very small lot size, < 1 minute holding, no SL) if the preset's policy treats them as abuse of the rule.
+
+## Minimum Trades
+- Count valid market trades only; exclude deposits, withdrawals, credits, corrections, internal adjustments.
+
+## Consistency Rule
+- threshold = preset.consistencyRulePercent.
+- consistency_percent = bestTradingDayProfit / totalClosedPnL × 100, only when totalClosedPnL > 0.
+- If totalClosedPnL ≤ 0 → NOT_ENOUGH_DATA (cannot evaluate consistency on a losing or break-even period).
+- BREACH if consistency_percent > threshold; WARNING if within 90–100% of threshold.
+
+## Minimum 2 Assets Rule (if configured)
+- Count distinct symbols traded. If the rule requires N distinct instruments, BREACH if < N.
 
 ## Trades Without Stop Loss
-- Source = metrics.tradesWithoutSL (array of tickets).
-- If non-empty AND the preset's prohibitedStrategies includes "no-SL high risk" or "Trades without SL", status = "WARNING" (or "BREACH" if any such trade resulted in a >2% loss of initial balance — promote severity).
-- relatedTickets MUST include the ticket numbers from metrics.tradesWithoutSL.
+- Source: metrics.tradesWithoutSL.
+- WARNING if non-empty; promote to BREACH if any such trade lost > 2% of initial balance, or if preset.prohibitedStrategies includes "no-SL high risk" / "Trades without SL".
+- relatedTickets MUST include the ticket numbers.
 
 ## Prohibited Strategy Patterns
-- Source = metrics.prohibitedPatterns plus your own inspection of trades_sample.
-- Defined thresholds (use these unless preset overrides):
-  - Martingale: 3+ consecutive trades on the same symbol/side where each subsequent volume is ≥1.5× the previous AND each closed at a loss.
-  - Grid: 5+ trades on the same symbol with overlapping open windows and evenly spaced entry prices.
-  - Stacking: 3+ trades on the same symbol/side opened within 60 seconds of each other.
-  - Tick scalping: median trade duration < 60 seconds across ≥30 trades.
-  - Lot size spike: volume ≥ 3× the median volume of the trader's prior 30 trades.
-  - Hedging within account: opposing positions on the same symbol opened within 60s of each other.
-- Each detected pattern becomes one ruleByRuleAnalysis entry with status "WARNING" or "BREACH" depending on severity. relatedTickets MUST list the involved tickets.
+Source: metrics.prohibitedPatterns + inspection of trades_sample. Default thresholds (unless preset overrides):
+- Martingale: 3+ consecutive same-symbol/same-direction trades each ≥1.5× the previous volume AND each closed at a loss → WARNING; ≥5 in a row or doubled volume → BREACH.
+- Grid / Position Stacking: 5+ trades on the same symbol with overlapping open windows and evenly-spaced entry prices → WARNING; identical entries pyramided → BREACH if account policy prohibits.
+- Stacking (lighter): 3+ same-symbol/side trades opened within 60 s → WARNING.
+- Tick scalping: median holding time < 60 s across ≥30 trades → WARNING; if the preset prohibits it and the median is < 15 s → BREACH.
+- Lot-size spike: volume ≥ 3× rolling median of the trader's prior 30 trades → WARNING (BREACH if combined with no-SL).
+- Hedging within account: opposing positions on the same symbol opened within 60 s → MANUAL_REVIEW.
+- High-Frequency Trading: very high trades/day on the same symbol with sub-minute holds — WARNING / MANUAL_REVIEW unless explicitly prohibited.
+Each detected pattern → one ruleByRuleAnalysis entry with relatedTickets listing every involved ticket.
 
 ## News Restrictions
 - Evaluate ONLY if preset.newsRestrictionEnabled is true.
 - If true and metrics.newsTradingFindings is present: enforce per-event windows (preset.newsMinutesBefore / preset.newsMinutesAfter) and flag any trade opened/closed inside a restricted window as BREACH.
-- If true but news data is not available client-side: mark NOT_ENOUGH_DATA with explanation="News-time data not available in this payload — requires server-side news calendar.".
-- If preset.newsRestrictionEnabled is false: include the rule with status="PASSED" and explanation="News restrictions are not enabled for this preset."
+- If true but news data is unavailable: NOT_ENOUGH_DATA with explanation="News-time data not available in this payload — requires server-side news calendar.".
+- If preset.newsRestrictionEnabled is false: status="PASSED" with explanation="News restrictions are not enabled for this preset.".
+
+## Policies that CANNOT be proven from the HTML alone
+The following policies typically require data the MT statement does not carry:
+- Platform exploit / latency arbitrage / spread manipulation.
+- Copy trading detection (requires multi-account correlation).
+- Account sharing (requires IP / device fingerprints).
+- Multi-account hedging (requires cross-account correlation).
+- EA usage (requires server-side logs).
+For each of these, output a rule entry with status="MANUAL_REVIEW" and explanation that lists the data needed for confirmation (IP logs, device fingerprints, execution latency, cross-account correlation, trade-copier matching, server logs, tick data, liquidity data). Never call these a definitive breach without external evidence.
 
 ## Payout Eligibility
-- Definition: a payout is eligible when ALL of the following are true:
+A payout is eligible when ALL of the following are true:
   1. Profit Target rule is PASSED or N/A (LIVE phase).
   2. Minimum Trading Days rule is PASSED.
   3. No CONFIRMED breaches across any of the above rules.
   4. Consistency Rule is PASSED.
   5. requestedPayout (if provided) ≤ closed P&L available.
-- This becomes one ruleByRuleAnalysis entry and also drives internalRecommendation:
-  - "APPROVE PAYOUT" only when all 5 are PASSED and there are no BREACH-severity items.
-  - "PARTIAL APPROVAL" when most are PASSED but consistency or daily-loss has WARNING (and the firm policy allows partial).
-  - "REJECT PAYOUT" when there are confirmed BREACH-severity findings.
-  - "MANUAL REVIEW REQUIRED" when material rules are NOT_ENOUGH_DATA or MANUAL_REVIEW, or when prohibited-pattern findings warrant a senior reviewer.
+Compute payoutEligibility as one ruleByRuleAnalysis entry.
+
+# internalRecommendation enum mapping
+
+Map the institutional decision to one of the existing tool-call enum values:
+- "APPROVE PAYOUT" — all 5 payout-eligibility conditions PASSED, no BREACH-severity items.
+- "PARTIAL APPROVAL" — most conditions PASSED but consistency or daily-loss has WARNING (firm policy allows partial), OR specific offending trades should have their profit removed (payout-reduction-recommended).
+- "REJECT PAYOUT" — confirmed BREACH on a material rule, account-closure or disqualification recommended.
+- "MANUAL REVIEW REQUIRED" — material rules are NOT_ENOUGH_DATA or MANUAL_REVIEW; suspicious prohibited-pattern findings without conclusive evidence.
 
 # finalDecision and severity
 
@@ -265,7 +316,15 @@ Evaluate every applicable rule below. For each rule, output one item in ruleByRu
 
 # evidenceTable
 
-Up to 30 rows. Each row is one observation supporting a finding. observation and ruleRef are mandatory; ticket/symbol/time are optional (e.g. "Minimum Trading Days" has no specific ticket — use observation="Trader logged 4 distinct trading days, below the 5-day minimum." with ruleRef="Minimum Trading Days").
+Up to 30 rows. Each row is one observation supporting a finding. observation and ruleRef are mandatory; ticket/symbol/time are optional (e.g. "Minimum Trading Days" has no specific ticket — use observation="Trader logged 4 distinct trading days, below the 5-day minimum.").
+
+# Extended optional fields (populate when relevant — UI will use them when present)
+
+- `tradeIdeaGroups`: array of { ideaId, symbol, direction, startTime, endTime, tickets[], totalLots, estimatedTotalRiskAmount, estimatedTotalRiskPercentage, allowedRiskPercentage, status, explanation }.
+- `dailyAnalysis`: array of { date, dayStartReference, dailyPnL, lowestObserved, dailyLossLimitAmount, dailyLossLimitPercent, status, affectedTickets[], explanation }.
+- `prohibitedPolicyReview`: array of { policyName, status (no_evidence|suspicious|breached|manual_review_required|not_applicable), severity, evidence, affectedTickets[], explanation, dataNeededForConfirmation[] }.
+- `accountSummaryExtras`: { netProfit, grossProfit, grossLoss, winningTrades, losingTrades, winRatePercent, profitFactor, largestWin, largestLoss, mostTradedSymbol, highestRiskSymbol }.
+- `humanReportMarkdown`: a complete professional markdown report with the sections: Executive Summary, Account Overview, Final Decision, Rule-by-Rule Review (with limits, observed, status, calculation, affected tickets), Critical Findings, Trade-Level Evidence, Max Risk per Trade Idea Analysis, Prohibited Trading Policy Review, Data Limitations, Recommended Action.
 
 # Email output (emailSubject + emailBody) — must be ready for the admin to copy and send without edits.
 
@@ -290,6 +349,10 @@ Hard prohibitions in emailBody (case-insensitive — NEVER include any of these 
 "claude", "anthropic", "openai", "gpt", "llm", "ai-generated", "ai generated", "language model", "automated by", "this is an automated", "generated by ai". Do not reference any AI or automation tooling, internal reasoning, confidence scores, or provider names. Do not promise outcomes outside the stated next step.
 
 emailSubject must be concise and reference the account number and outcome (e.g. "Payout Review – Account 12345 – Manual Review Required").
+
+# Output contract
+
+You respond ONLY by calling the submit_audit_result tool with valid structured output. No prose outside the tool call. Use the exact UPPER_SNAKE_CASE enum values where the schema requires them (finalDecision, severity, per-rule status / dataQuality). Populate the extended optional fields (humanReportMarkdown, tradeIdeaGroups, dailyAnalysis, prohibitedPolicyReview, accountSummaryExtras) whenever the data supports it.
 """
 
 
@@ -380,6 +443,102 @@ SUBMIT_AUDIT_TOOL = {
             },
             "emailSubject": {"type": "string"},
             "emailBody": {"type": "string"},
+
+            # Extended optional fields (populated when the data supports them).
+            # The UI consumes these progressively — absence is fine.
+            "humanReportMarkdown": {
+                "type": "string",
+                "description": "Full professional markdown report (Executive Summary, Account Overview, Rule-by-Rule Review, Critical Findings, Trade-Level Evidence, Max Risk per Trade Idea Analysis, Prohibited Trading Policy Review, Data Limitations, Recommended Action).",
+            },
+            "tradeIdeaGroups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ideaId": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["BUY", "SELL", "MIXED"]},
+                        "startTime": {"type": "string"},
+                        "endTime": {"type": "string"},
+                        "tickets": {"type": "array", "items": {"type": "string"}},
+                        "totalLots": {"type": "number"},
+                        "estimatedTotalRiskAmount": {"type": "number"},
+                        "estimatedTotalRiskPercentage": {"type": "number"},
+                        "allowedRiskPercentage": {"type": "number"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["PASSED", "WARNING", "BREACH", "MANUAL_REVIEW"],
+                        },
+                        "explanation": {"type": "string"},
+                    },
+                    "required": ["ideaId", "symbol", "tickets", "status", "explanation"],
+                },
+            },
+            "dailyAnalysis": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string"},
+                        "dayStartReference": {"type": "number"},
+                        "dailyPnL": {"type": "number"},
+                        "lowestObserved": {"type": "number"},
+                        "dailyLossLimitAmount": {"type": "number"},
+                        "dailyLossLimitPercent": {"type": "number"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["PASSED", "WARNING", "BREACH", "MANUAL_REVIEW", "NOT_ENOUGH_DATA"],
+                        },
+                        "affectedTickets": {"type": "array", "items": {"type": "string"}},
+                        "explanation": {"type": "string"},
+                    },
+                    "required": ["date", "status", "explanation"],
+                },
+            },
+            "prohibitedPolicyReview": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "policyName": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "NO_EVIDENCE",
+                                "SUSPICIOUS",
+                                "BREACHED",
+                                "MANUAL_REVIEW_REQUIRED",
+                                "NOT_APPLICABLE",
+                            ],
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                        },
+                        "evidence": {"type": "string"},
+                        "affectedTickets": {"type": "array", "items": {"type": "string"}},
+                        "explanation": {"type": "string"},
+                        "dataNeededForConfirmation": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["policyName", "status", "explanation"],
+                },
+            },
+            "accountSummaryExtras": {
+                "type": "object",
+                "properties": {
+                    "netProfit": {"type": "number"},
+                    "grossProfit": {"type": "number"},
+                    "grossLoss": {"type": "number"},
+                    "winningTrades": {"type": "integer"},
+                    "losingTrades": {"type": "integer"},
+                    "winRatePercent": {"type": "number"},
+                    "profitFactor": {"type": "number"},
+                    "largestWin": {"type": "number"},
+                    "largestLoss": {"type": "number"},
+                    "mostTradedSymbol": {"type": "string"},
+                    "highestRiskSymbol": {"type": "string"},
+                },
+            },
         },
         "required": [
             "finalDecision",
@@ -799,7 +958,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "risk-manager-api",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "configured": {
             "anthropic_key": bool(ANTHROPIC_API_KEY),
             "api_secret": bool(API_SECRET),
