@@ -1,6 +1,6 @@
 # Railway deployment config — explicitly tells Railway:
 #  - Build using the Dockerfile (not Nixpacks auto-detect)
-#  - The app listens on $PORT (Railway-assigned, usually 8080)
+#  - App listens on port 8000 (matches Railway's Target Port for this service)
 #  - Health check path for the platform to know the app is up
 #  - Restart on failure with a small backoff
 
@@ -9,6 +9,7 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+startCommand = "uvicorn api:app --host 0.0.0.0 --port 8000"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
