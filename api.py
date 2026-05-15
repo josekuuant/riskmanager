@@ -249,11 +249,14 @@ Source: metrics.tradeIdeaRiskAnalysis. A trade idea = trades sharing the same sy
 ## Minimum Trades
 - Count valid market trades only; exclude deposits, withdrawals, credits, corrections, internal adjustments.
 
-## Consistency Rule
-- threshold = preset.consistencyRulePercent.
-- consistency_percent = bestTradingDayProfit / totalClosedPnL × 100, only when totalClosedPnL > 0.
-- If totalClosedPnL ≤ 0 → NOT_ENOUGH_DATA (cannot evaluate consistency on a losing or break-even period).
-- BREACH if consistency_percent > threshold; WARNING if within 90–100% of threshold.
+## Consistency Rule — INSTANT program ONLY
+- The consistency cap applies exclusively to the INSTANT program (account.accountType == "INSTANT"). The default cap is 15% of total profit on the best trading day.
+- For non-INSTANT accounts (ONE_STEP, TWO_STEP at any phase, LIVE funded): include a single ruleByRuleAnalysis entry with status="PASSED" and explanation="Consistency rule does not apply to this program — Instant-only." Do NOT compute a consistency percentage and do NOT count it as a breach.
+- For INSTANT accounts:
+  - threshold = preset.consistencyRulePercent (default 15 when unset).
+  - consistency_percent = bestTradingDayProfit / totalClosedPnL × 100, only when totalClosedPnL > 0.
+  - If totalClosedPnL ≤ 0 → NOT_ENOUGH_DATA (cannot evaluate consistency on a losing or break-even period).
+  - BREACH if consistency_percent > threshold; WARNING if within 90–100% of threshold.
 
 ## Minimum 2 Assets Rule (if configured)
 - Count distinct symbols traded. If the rule requires N distinct instruments, BREACH if < N.
@@ -294,9 +297,9 @@ A payout is eligible when ALL of the following are true:
   1. Profit Target rule is PASSED or N/A (LIVE phase).
   2. Minimum Trading Days rule is PASSED.
   3. No CONFIRMED breaches across any of the above rules.
-  4. Consistency Rule is PASSED.
+  4. Consistency Rule is PASSED or N/A (only INSTANT enforces consistency).
   5. requestedPayout (if provided) ≤ closed P&L available.
-Compute payoutEligibility as one ruleByRuleAnalysis entry.
+Compute payoutEligibility as one ruleByRuleAnalysis entry. Do NOT block a payout on consistency for non-INSTANT accounts.
 
 # internalRecommendation enum mapping
 
@@ -326,18 +329,45 @@ Up to 30 rows. Each row is one observation supporting a finding. observation and
 - `accountSummaryExtras`: { netProfit, grossProfit, grossLoss, winningTrades, losingTrades, winRatePercent, profitFactor, largestWin, largestLoss, mostTradedSymbol, highestRiskSymbol }.
 - `humanReportMarkdown`: a complete professional markdown report with the sections: Executive Summary, Account Overview, Final Decision, Rule-by-Rule Review (with limits, observed, status, calculation, affected tickets), Critical Findings, Trade-Level Evidence, Max Risk per Trade Idea Analysis, Prohibited Trading Policy Review, Data Limitations, Recommended Action.
 
-# Email output (emailSubject + emailBody) — must be ready for the admin to copy and send without edits.
+# Email output (emailSubject + emailBody) — must be ready for the admin to copy and send WITHOUT EDITS to the trader.
 
-Structure for emailBody:
-1. Greeting using the trader's name (e.g. "Dear {{traderName}},").
-2. State that the Risk & Compliance team has completed a review of the payout request.
-3. Reference the account number explicitly.
-4. State the result clearly (passed / warning / breach / manual review required).
-5. Explain the breached rule(s) or manual-review reason in plain language.
-6. Include an Evidence section listing each relevant trade with: ticket, symbol, direction, volume, open time, close time, entry price, close price, SL, TP, P&L, allowed threshold, and actual result. Use only values present in the input data — write "N/A" when a field is missing. Format as a readable list or aligned text block (NO markdown tables, no `|` characters used as table separators, no triple backticks).
-7. Briefly explain in simple language why the rule was breached or why review is required.
-8. State the next step clearly: payout approved, payout rejected, partial approval, or manual review required.
-9. Professional closing signed by "Risk & Compliance Team".
+The email is the trader-facing artifact. It must be DETAILED, EVIDENCE-BASED, and explain — for every flagged item — exactly which trades, at what time, in what way, and why something happened. This is not a "you got rejected" letter; it is the firm's professional record of the review.
+
+Required structure for emailBody (in this exact order):
+
+1. Greeting: "Dear {{traderName}},"
+2. Opening paragraph: state that the Risk & Compliance team has completed the review of the payout request for account {{accountNumber}} on the {{program}} {{phase}} program. Mention the review period (first trade open time → last trade close time) and the number of closed trades evaluated.
+3. Result paragraph: state the outcome (passed / warning / breach / manual review required) and the recommended action plainly. One short paragraph.
+4. Account overview block (5–7 lines, "label: value" format, no table syntax):
+   - Initial balance
+   - Final balance (or last observed)
+   - Net realized P&L (and % of initial)
+   - Trading days
+   - Symbols traded
+   - Best day P&L (date, amount)
+   - Worst day P&L (date, amount)
+5. "Findings" section — one block per rule that is NOT PASSED. For each block include:
+   - Rule name (e.g. "Maximum Loss Limit")
+   - Configured limit (e.g. "10.00% / $1,000.00")
+   - Observed value (e.g. "11.42% / $1,142.00 closed-trade drawdown peaking on 2026-05-14")
+   - Calculation method (one sentence — e.g. "max_loss_limit = initial_balance × maxLossPercent / 100")
+   - Why it was breached (one paragraph in plain English referencing the trader's actual trades — date, time, size, sequence — not abstract reasoning)
+   - Evidence (5–10 most relevant tickets max, ONE PER LINE in this format):
+       Ticket {ticket} — {symbol} {direction} {volume} lots | opened {YYYY-MM-DD HH:MM:SS} @ {entryPrice} (SL {stopLoss}, TP {takeProfit}) | closed {YYYY-MM-DD HH:MM:SS} @ {closePrice} | commission {commission} | swap {swap} | P&L {profit}
+     Use "N/A" for missing fields. NEVER fabricate values.
+6. Optional "Trade idea risk" section if any trade-idea breach exists: for each breaching idea list the symbol, direction, time window, total lots, estimated risk amount + percent, allowed percent, and the cluster of tickets involved.
+7. "Data limitations" — one short paragraph listing what could NOT be confirmed from the HTML alone (intra-trade equity, server-side news data, IP / device, EA usage, etc.) if any rule was marked MANUAL_REVIEW or ESTIMATED.
+8. "Next step" paragraph — explicit and unambiguous:
+   - For APPROVED: "Your payout request of {{requestedPayout}} has been approved and will be processed within {standard schedule}."
+   - For PARTIAL APPROVAL / payout reduction: state the original amount, the deduction (with the offending trade(s)), and the approved amount.
+   - For REJECT PAYOUT / BREACH: state that the payout has been declined and the consequence on the account (closure / disqualification, per firm policy).
+   - For MANUAL REVIEW: state that the team will follow up within {1–2} business days with the next steps; no action required from the trader.
+9. Closing: "If you have any questions about this review, you may reply to this email. Best regards, Risk & Compliance Team".
+
+Format rules:
+- Plain text only. NO markdown headings (`#`), NO markdown tables, NO `|` characters used as table separators, NO triple backticks, NO `**bold**` markers. Use uppercase short labels for section titles (e.g. "FINDINGS", "EVIDENCE", "NEXT STEP") on their own line if section separation helps readability.
+- Numeric formatting: dollars with comma separators and 2 decimals ("$1,142.00"), percentages with 2 decimals ("11.42%"), times in YYYY-MM-DD HH:MM:SS (account.serverTimezone if available).
+- Stay under ~800 words but never sacrifice required evidence detail.
 
 Email tone:
 - Professional, firm, respectful, compliance-oriented.
@@ -348,7 +378,7 @@ Email tone:
 Hard prohibitions in emailBody (case-insensitive — NEVER include any of these substrings):
 "claude", "anthropic", "openai", "gpt", "llm", "ai-generated", "ai generated", "language model", "automated by", "this is an automated", "generated by ai". Do not reference any AI or automation tooling, internal reasoning, confidence scores, or provider names. Do not promise outcomes outside the stated next step.
 
-emailSubject must be concise and reference the account number and outcome (e.g. "Payout Review – Account 12345 – Manual Review Required").
+emailSubject must be concise and reference the account number and outcome, e.g. "Payout Review — Account 12345 — Breach Confirmed" or "Payout Review — Account 12345 — Approved" or "Payout Review — Account 12345 — Manual Review Required".
 
 # Output contract
 
