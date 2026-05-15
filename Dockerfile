@@ -7,9 +7,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api.py ./
 
-# Railway/Render setean $PORT; Fly.io usa 8080; default 8000 para local.
-ENV PORT=8000
-EXPOSE 8000
+# Railway sets $PORT dynamically (usually 8080). For local dev, default to 8080
+# so EXPOSE / health checks / Railway target_port all line up out of the box.
+ENV PORT=8080
+EXPOSE 8080
 
-# Shell form para que $PORT se expanda
-CMD uvicorn api:app --host 0.0.0.0 --port ${PORT}
+# JSON form via sh -c so ${PORT} still expands at runtime.
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port ${PORT}"]
