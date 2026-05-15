@@ -145,12 +145,48 @@ Analyze every applicable rule:
 - Maximum Loss
 - Max Risk Per Trade Idea
 - Max Exposure Per Symbol
+- Maximum Open Risk (INSTANT ONLY — 1% hard breach)
 - Consistency Rule
 - Minimum Trading Days
 - Trades without SL
 - Prohibited strategy patterns (martingale, grid, stacking, tick scalping, no-SL high risk, lot size spikes, hedging/mirroring)
 - Payout eligibility
 - Manual review items
+
+## CRITICAL RULE — Maximum Open Risk (Instant program only)
+
+For accounts on the Instant program, there is an additional HARD BREACH rule:
+
+  The total floating loss across all simultaneously open positions must
+  never exceed 1% of the account balance at any time. If breached, the
+  account is closed and any payout is rejected. This is NOT a warning,
+  NOT a profit adjustment — it is a definitive BREACH.
+
+How to evaluate this rule from a MetaTrader HTML report:
+
+  1. Build a timeline of "trade open" and "trade close" events from the
+     parsed trades.
+  2. At each "trade open" event, identify all OPEN positions at that
+     instant. For each open position, compute risk-at-stake:
+       - If stop loss is set: risk = |entry_price - stop_loss| × volume × contract_size
+       - If no stop loss: risk is theoretically unbounded → flag as MANUAL_REVIEW
+  3. Sum the risk-at-stake of all open positions at that moment.
+  4. If sum > 1% of initial balance at ANY moment, this is a BREACH.
+  5. If at any moment two or more positions are simultaneously open and at
+     least one has no stop loss, flag as MANUAL_REVIEW (cannot confirm
+     compliance without server-side equity history).
+
+When reporting this rule:
+  - status: "BREACH" if any moment's open-risk sum > 1% of balance with
+    all SLs known
+  - status: "MANUAL_REVIEW" if SL data is incomplete on open trades
+  - status: "PASS" if always under 1% and all SLs are known
+  - dataQuality: "ESTIMATED" — based on SL distances from HTML, not on
+    actual intraday equity history
+  - rule name in output: "Maximum Open Risk (1%)"
+  - In the email, frame as "the total potential loss across open positions
+    exceeded the 1% open-risk limit configured for the Instant program".
+
 
 Email output (emailSubject + emailBody) — must be ready for the admin to copy and send to the trader without edits.
 
