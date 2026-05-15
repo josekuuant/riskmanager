@@ -1,5 +1,0 @@
-name: risk-compliance-env
-config:
-  type: cloud
-  networking:
-    type: unrestricted

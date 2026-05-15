@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 outputs/
 trades/
+rules/
 .venv/
 venv/

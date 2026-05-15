@@ -1,431 +1,328 @@
-# NYS Risk Manager — Engine + Agente para revisión de cuentas prop firm
+# NYS Risk Manager API
 
-Sistema deterministico para evaluar cuentas de NYS Markets contra las reglas de los 3 modelos (Instant, 1-Step, 2-Step) y sus fases. Genera veredicto, reporte interno y email al cliente.
+Backend Python (FastAPI) que recibe trades + métricas ya parseados desde el frontend Lovable y devuelve el audit estructurado generado por Claude (Anthropic Messages API + tool calling).
 
-## Cómo funciona
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. ENGINE (Python puro, deterministico, sin LLM)                   │
-│     rules_engine.py + mt5_parser.py                                 │
-│     → Calcula daily DD, total DD, profit target, exposure, payout   │
-│     → Output: JSON estructurado con findings + verdict              │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  2. AGENTE NARRADOR (Anthropic Managed Agents)                      │
-│     agent.yaml + run_session.py                                     │
-│     → Recibe JSON, NO recalcula                                     │
-│     → Output: VEREDICTO + REPORTE INTERNO + EMAIL                   │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-El **engine** hace todo el trabajo numérico (auditable, sin variación entre corridas). El **agente** solo escribe los textos legibles para humanos.
-
-## Estructura del proyecto
+## Arquitectura
 
 ```
-riskmanager/
-├── rules_engine.py      Motor: reglas codificadas por modelo+fase
-├── mt5_parser.py        Parser de MT5 ReportHistory.html (UTF-16)
-├── local_check.py       CLI para análisis local (dry-run sin LLM)
-├── run_session.py       CLI que llama al agente Anthropic
-├── api.py               HTTP API (FastAPI) para integración con Lovable
-├── agent.yaml           Config del agente Anthropic Managed
-├── environment.yaml     Sandbox del agente (cloud, networking)
-├── seed_memory.py       (legacy) carga reglas a memory store
-├── Dockerfile           Para deployar la API
-├── requirements.txt     Dependencias Python
-├── .env.example         Template de env vars
-└── rules/               PDFs originales de NYS por modelo
-    ├── instant/rules.pdf
-    ├── 1step/rules.pdf
-    ├── 1step/live.pdf
-    ├── 2step/rules.pdf
-    └── 2step/live.pdf
+┌────────────────────────────── Frontend (Lovable / TanStack Start) ──────────────────────────────┐
+│                                                                                                 │
+│  /reviewer                                                                                      │
+│   ├─ User sube ReportHistory.html                                                               │
+│   ├─ parseReport()  → trades[] (en el browser)                                                  │
+│   ├─ computeMetrics() → DeterministicMetrics  (TODO en TS, autoritativo)                        │
+│   ├─ detectFraudSignals() → FraudSignal[]                                                       │
+│   └─ analyzeWithRiskManager()  ── HTTPS ──┐                                                     │
+│                                            │  POST /audit                                       │
+│                                            │  Header: X-API-Key                                 │
+│                                            │  Body: { account, preset, trades, metrics }        │
+└────────────────────────────────────────────┼────────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+┌──────────────────────────────────── API Python (Railway) ───────────────────────────────────────┐
+│                                                                                                 │
+│  api.py                                                                                         │
+│   ├─ Valida X-API-Key contra API_SECRET                                                         │
+│   ├─ Pasa el contexto a Claude Messages API                                                     │
+│   ├─ Fuerza tool_choice=submit_audit_result (structured output garantizado)                     │
+│   └─ Devuelve { finalDecision, severity, executiveSummary, breaches,                            │
+│                 warnings, evidenceTable, internalRecommendation,                                │
+│                 emailSubject, emailBody }                                                       │
+└────────────────────────────────────────────┬────────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+                                  ┌──────────────────────┐
+                                  │ api.anthropic.com    │
+                                  │ claude-opus-4-7      │
+                                  └──────────────────────┘
 ```
 
-## Reglas codificadas (resumen)
+**Importante**: la API NO recalcula ningún número. El frontend ya hace todo el cálculo determinístico (trades, P&L, drawdown, exposure, fraud signals, etc.) y se lo pasa a Claude para que **explique, contextualice y genere el email** — no para que recalcule.
 
-| Modelo / Fase | Daily Loss | Max Loss | Profit Target | Min Days | News |
-|---|---|---|---|---|---|
-| Instant | **3% trailing** intraday | **5% trailing** equity | 3% para payout | — | NO |
-| 1-Step Eval | 3% fixed (open) | 6% fixed (initial) | 10% | 3 | SÍ |
-| 1-Step Funded | 3% fixed (open) | 6% fixed (initial) | — | — | NO |
-| 2-Step Phase 1 | 5% fixed (open) | 10% fixed (initial) | 8% | 3 | SÍ |
-| 2-Step Phase 2 | 5% fixed (open) | 10% fixed (initial) | 5% | 3 | SÍ |
-| 2-Step Funded | 5% fixed (open) | 10% fixed (initial) | — | — | NO |
+## Setup en Railway
 
-**Reglas adicionales chequeadas:**
-- **Exposure por símbolo (4%)**: dual-metric — risk-at-stake con SL + margin committed
-- **15% Consistency Rule** (instant): mejor día ≤ 15% del profit total
-- **Min Profitable Days** (instant): ≥7 días con ≥0.25% del initial en 30d para payout
-- **Min Trading Days**: 3 para eval phases, contado por `open_time`
-- **Reconciliación**: balance final = initial + sum(net_pnl)
-- **Trading day**: reset a 21:00 UTC (server rollover NYS), no calendar day
+### 1. Variables de entorno
 
-**Reglas NO chequeadas** (requieren data externa o detección heurística):
-- News trading (necesita calendario económico)
-- HFT / latency arbitrage / tick scalping
-- Copy trading / account sharing / third party
-- Patrones de comportamiento (martingala, over-leveraging súbito)
+En tu proyecto Railway → tab **Variables**:
 
-El agente las marca como "merece revisión humana" si detecta sospechas.
+| Variable | Cómo obtenerla | Ejemplo |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | console.anthropic.com → API Keys → Create | `sk-ant-api03-AbCd...` |
+| `API_SECRET` | `openssl rand -hex 32` (en tu terminal) | `a3f7c9e2b8d4...` (32 bytes hex) |
+| `ALLOWED_ORIGINS` | Tu URL de Lovable production + dev | `https://tu-app.lovable.app,http://localhost:5173` |
 
-## Setup local
+Opcionales (defaults razonables):
 
-```sh
-# Requisitos
-# - Python 3.11+
-# - poppler-utils (solo si vas a usar seed_memory.py con PDFs)
-#   - macOS: brew install poppler
-#   - Linux: sudo apt install poppler-utils
+| Variable | Default | Para qué |
+|---|---|---|
+| `ANTHROPIC_MODEL` | `claude-opus-4-7` | Cambiar a `claude-sonnet-4-6` ahorra ~50% si querés |
+| `ANTHROPIC_MAX_TOKENS` | `8000` | Suficiente para audit + email + tablas |
+| `MAX_TRADES_IN_PROMPT` | `300` | Cap del sample que se manda al modelo |
+| `PORT` | `8000` (Railway lo setea) | No tocar |
 
-# Clonar e instalar
-git clone <repo-url>
+### 2. Verificar el deploy
+
+Una vez seteadas las vars, Railway redeploya solo. Verificá:
+
+```bash
+# Healthcheck (no auth) — debe devolver configured=true para anthropic_key y api_secret
+curl https://riskmanager-production.up.railway.app/health
+```
+
+Esperado:
+```json
+{
+  "status": "ok",
+  "service": "risk-manager-api",
+  "version": "2.0.0",
+  "configured": {
+    "anthropic_key": true,
+    "api_secret": true,
+    "model": "claude-opus-4-7"
+  }
+}
+```
+
+Si `anthropic_key: false` o `api_secret: false`, falta cargar esa variable.
+
+### 3. Test real
+
+```bash
+export API="https://riskmanager-production.up.railway.app"
+export KEY="<tu-API_SECRET>"
+
+curl -X POST $API/audit \
+  -H "X-API-Key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account": {
+      "accountNumber": "TEST-001",
+      "traderName": "Test Trader",
+      "accountType": "TWO_STEP",
+      "phase": "LIVE",
+      "accountSize": 5000,
+      "initialBalance": 5000,
+      "serverTimezone": "UTC",
+      "dailyResetTime": "21:00"
+    },
+    "preset": {
+      "id": "two-step-live",
+      "name": "2-Step Live",
+      "description": "Standard 2-step live rules",
+      "dailyLossPercent": 5,
+      "maxLossPercent": 10,
+      "profitTargetPercent": 0,
+      "maxExposurePerSymbolPercent": 4,
+      "consistencyRulePercent": 0,
+      "prohibitedStrategies": []
+    },
+    "trades": [],
+    "metrics": {
+      "totalClosedPnL": 800.87,
+      "tradingDaysCount": 13,
+      "profitTargetReached": "NOT_ENOUGH_DATA",
+      "maxClosedLossPercent": 4.92,
+      "tradesWithoutSL": []
+    }
+  }'
+```
+
+Devuelve JSON con `data.finalDecision`, `data.emailBody`, `data.internalRecommendation`, etc. — el shape exacto que `riskmanager.functions.ts` espera.
+
+## Setup en Lovable
+
+### 1. Variables de entorno en Lovable
+
+En tu proyecto Lovable → Settings → Environment Variables:
+
+| Variable | Valor |
+|---|---|
+| `RISKMANAGER_API_URL` | `https://riskmanager-production.up.railway.app` |
+| `RISKMANAGER_API_KEY` | El **mismo `API_SECRET`** que pusiste en Railway |
+
+> ⚠️ **Importante**: `RISKMANAGER_API_KEY` debe estar como **server-side env var** (no `VITE_*`), porque tu `riskmanager.functions.ts` la usa en un `createServerFn` (server function). Así nunca llega al browser.
+
+### 2. Verificá que el frontend la lee
+
+En tu repo Lovable hay `src/lib/riskmanager.functions.ts`. Tiene esto:
+
+```typescript
+const baseUrl = process.env.RISKMANAGER_API_URL;
+const envKey = process.env.RISKMANAGER_API_KEY;
+```
+
+Si esas dos están seteadas en Lovable, ya está conectado. Probá desde la UI:
+
+1. Abrí `/reviewer` en tu app
+2. Subí un `ReportHistory.html`
+3. Llená los campos del form
+4. Click **Analyze**
+5. La sección de análisis debe poblarse con `finalDecision`, breaches, email body, etc.
+
+## Endpoints
+
+Los 4 endpoints **hacen lo mismo** — son aliases para compatibilidad con el `riskmanager.functions.ts` del frontend que acepta `endpoint = "analyze" | "full" | "narrate" | "audit"`.
+
+| Endpoint | Auth | Descripción |
+|---|---|---|
+| `GET  /health` | público | Status + config (chequear si `anthropic_key` y `api_secret` están true) |
+| `POST /audit` | `X-API-Key` | Audit canonical |
+| `POST /analyze` | `X-API-Key` | Alias de `/audit` |
+| `POST /full` | `X-API-Key` | Alias de `/audit` (lo que el frontend usa por default) |
+| `POST /narrate` | `X-API-Key` | Alias de `/audit` |
+
+### Request schema
+
+```typescript
+{
+  account: {
+    accountNumber: string,
+    traderName: string,
+    traderEmail?: string,
+    accountType: "ONE_STEP" | "TWO_STEP" | "INSTANT",
+    phase: "PHASE_1" | "PHASE_2" | "LIVE",
+    accountSize: number,
+    initialBalance: number,
+    currentBalance?: number,
+    currentEquity?: number,
+    requestedPayout?: number,
+    serverTimezone: string,
+    dailyResetTime: string
+  },
+  preset: {
+    id: string,
+    name: string,
+    description: string,
+    profitTargetPercent?: number,
+    dailyLossPercent?: number,
+    maxLossPercent?: number,
+    maxRiskPerTradeIdeaPercent?: number,
+    maxExposurePerSymbolPercent?: number,
+    consistencyRulePercent?: number,
+    minTradingDays?: number,
+    prohibitedStrategies: string[]
+  },
+  trades: Trade[],          // los trades parseados por el frontend
+  metrics: DeterministicMetrics  // ya calculados por el frontend
+}
+```
+
+### Response schema
+
+```typescript
+{
+  ok: true,
+  data: {
+    finalDecision: "PASSED" | "WARNING" | "BREACH" | "MANUAL_REVIEW",
+    severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+    executiveSummary: string,
+    confirmedBreaches: RuleAnalysis[],
+    estimatedBreaches: RuleAnalysis[],
+    warnings: RuleAnalysis[],
+    notEnoughData: RuleAnalysis[],
+    ruleByRuleAnalysis: RuleAnalysis[],
+    evidenceTable: EvidenceRow[],
+    internalRecommendation: "APPROVE PAYOUT" | "REJECT PAYOUT" |
+                            "PARTIAL APPROVAL" | "MANUAL REVIEW REQUIRED",
+    emailSubject: string,
+    emailBody: string
+  },
+  latencyMs: number,
+  model: "claude-opus-4-7",
+  usage: { input_tokens, output_tokens, ... },
+  trades_dropped: number   // si trades > MAX_TRADES_IN_PROMPT, cuántos se muestrearon
+}
+```
+
+### Error response
+
+```typescript
+{
+  ok: false,
+  error: string,
+  status: number  // 401 / 403 / 422 / 502 / 504
+}
+```
+
+## Costos
+
+Cada audit usa ~50K-150K tokens input (depende de cuántos trades) + ~3-5K output:
+
+| Modelo | Input/1M | Output/1M | Costo típico por audit |
+|---|---|---|---|
+| **claude-opus-4-7** (default) | $5 | $25 | **$0.30 – $0.85** |
+| claude-sonnet-4-6 | $3 | $15 | $0.15 – $0.45 |
+| claude-haiku-4-5 | $1 | $5 | $0.05 – $0.15 |
+
+Para 100 audits/mes con Opus: ~$30-85/mes. Cambiá a Sonnet en `ANTHROPIC_MODEL` para ahorrar ~50%.
+
+## Desarrollo local
+
+```bash
+# Clonar y entrar
+git clone <repo>
 cd riskmanager
-pip install -r requirements.txt
 
-# Variables de entorno
+# Setup
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 cp .env.example .env
 # Editar .env con tus valores
-```
 
-### Variables de entorno
-
-| Variable | Para qué | Requerido para |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | API key de Anthropic | Agente + API `/narrate`, `/full` |
-| `AGENT_ID` | ID del Managed Agent | Idem |
-| `ENV_ID` | ID del Environment | Idem |
-| `API_SECRET` | Secret para auth de la API HTTP | API en producción |
-| `ALLOWED_ORIGINS` | Dominios permitidos por CORS | API en producción |
-
-## Uso local (CLI)
-
-### Análisis solo (sin LLM, gratis)
-
-```sh
-# Instant $10K
-python local_check.py trades/ReportHistory9708.html --model instant --size 10000
-
-# 2-step funded $5K
-python local_check.py trades/ReportHistory5621.html --model 2step --phase funded
-
-# Con previous payouts (afecta split 80% → 90%)
-python local_check.py trades/report.html --model 2step --phase funded --previous-payouts 3
-
-# Output JSON (para feeding a otra app)
-python local_check.py trades/report.html --model instant --json > analysis.json
-```
-
-### Con el agente narrador
-
-Primero hacer setup del agente (una sola vez):
-
-```sh
-# Instalar la CLI de Anthropic
-brew install anthropics/tap/ant
-# o: go install github.com/anthropics/anthropic-cli/cmd/ant@latest
-
-# Crear agent + environment
-export ANTHROPIC_API_KEY=sk-ant-...
-export AGENT_ID=$(ant beta:agents create < agent.yaml --transform id -r)
-export ENV_ID=$(ant beta:environments create < environment.yaml --transform id -r)
-
-# Guardar en .env
-echo "AGENT_ID=$AGENT_ID" >> .env
-echo "ENV_ID=$ENV_ID" >> .env
-```
-
-Después, en cada revisión:
-
-```sh
-source .env
-python run_session.py 2step trades/ReportHistory5621.html --phase funded
-# → Engine corre primero (local), después el agente narra el resultado
-# → Outputs en ./outputs/
-```
-
-## API HTTP (para Lovable)
-
-### Correr la API local
-
-```sh
-# Desarrollo
+# Correr
 uvicorn api:app --reload --port 8000
 
-# Test
+# Probar
 curl http://localhost:8000/health
 ```
 
-### Endpoints
+## Troubleshooting
 
-| Endpoint | Auth | Qué hace |
-|---|---|---|
-| `GET /health` | público | Healthcheck |
-| `POST /analyze` | API key | Sube reporte HTML, recibe análisis JSON (sin LLM, rápido y barato) |
-| `POST /narrate` | API key | Recibe JSON, devuelve reporte + email (llama al agente) |
-| `POST /full` | API key | Combinación: subi reporte y recibí análisis + narración en una sola llamada |
+### `anthropic_key: false` en /health
+La env var `ANTHROPIC_API_KEY` no está cargada. En Railway → Variables → agregarla → Railway redeploya solo.
 
-### Ejemplo de llamada
+### `Invalid API key` (HTTP 403) cuando llamás desde Lovable
+El `RISKMANAGER_API_KEY` que pusiste en Lovable no coincide con el `API_SECRET` que pusiste en Railway. Copiá el mismo valor en ambos lados.
 
-```sh
-# Análisis solo
-curl -X POST http://localhost:8000/analyze \
-  -H "X-API-Key: $API_SECRET" \
-  -F "report=@trades/ReportHistory5621.html" \
-  -F "model=2step" \
-  -F "phase=funded"
-```
+### `Anthropic API error (401)` (HTTP 502)
+Tu `ANTHROPIC_API_KEY` no es válida. Verificá en console.anthropic.com que la key existe y tiene billing activado.
 
-```json
-{
-  "model": "2step",
-  "phase": "funded",
-  "initial_balance": 5000.0,
-  "final_balance": 5800.87,
-  "verdict": "WARNING",
-  "findings": [
-    {
-      "severity": "warning",
-      "rule": "Max Exposure per Symbol (4.0%) — MARGEN",
-      "detail": "Pico RISK-AT-STAKE (SL): $182.98 (3.7%) ...",
-      "date": "2026-04-20"
-    }
-  ],
-  "payout": {
-    "eligible": true,
-    "closed_profit": 800.87,
-    "profit_split_pct": 80,
-    "payout_trader_usd": 640.70,
-    "payout_company_usd": 160.17
-  },
-  "daily_breakdown": [ ... ],
-  "metrics": { ... }
-}
-```
+### `Anthropic API error (429)` (HTTP 502)
+Rate limit hit. Para uso masivo, considerá Batches API o tier paid más alto en console.anthropic.com.
 
-### Deploy de la API
+### `Anthropic API error (500/529)` (HTTP 502)
+Server-side error de Anthropic. Reintentar (idempotente). Si es persistente, ver status.anthropic.com.
 
-#### Opción A: Railway (más fácil)
+### CORS error desde el browser
+Agregá tu URL de Lovable a `ALLOWED_ORIGINS` en Railway. Si es solo desde server functions (lo recomendado), CORS no aplica.
 
-```sh
-# Tener Railway CLI: brew install railway
-railway init
-railway up
-# Configurar env vars en el dashboard de Railway:
-#   ANTHROPIC_API_KEY, AGENT_ID, ENV_ID, API_SECRET, ALLOWED_ORIGINS
-```
+### `Model did not call the tool` (HTTP 502)
+Raro pero posible si el contexto está malformado. Verificar que `account`, `preset`, `trades`, `metrics` se mandan con las shapes correctas (ver schema arriba). Logs en Railway tienen detalles.
 
-#### Opción B: Render
+### Latencia alta (>30s)
+Normal para audits grandes (muchos trades). Si pasa 45s consistentemente, bajar `MAX_TRADES_IN_PROMPT` a 200 o usar Sonnet en lugar de Opus.
 
-1. Crear servicio nuevo en https://render.com → Connect repo
-2. Settings:
-   - Runtime: Docker
-   - Plan: Starter ($7/mo) o Free (con cold starts)
-3. Environment: agregar `ANTHROPIC_API_KEY`, `AGENT_ID`, `ENV_ID`, `API_SECRET`, `ALLOWED_ORIGINS`
-
-#### Opción C: Fly.io / Cloud Run / VPS
-
-El Dockerfile que viene en el repo está listo para cualquier plataforma que corra contenedores. Build:
-
-```sh
-docker build -t riskmanager-api .
-docker run -p 8000:8000 --env-file .env riskmanager-api
-```
-
-## Integración con Lovable (frontend React)
-
-### 1. Configurar el endpoint en tu proyecto Lovable
-
-En el chat de Lovable:
+## Estructura del repo
 
 ```
-Quiero integrar una API externa de risk management.
-La API está en: https://riskmanager-api.tudominio.com
-Autenticación: header X-API-Key con secret almacenado en variables de entorno (no hardcodear).
-Crear un servicio TypeScript que llame a POST /analyze con FormData (file + campos).
+riskmanager/
+├── api.py              ← Toda la API (FastAPI + Anthropic client + tool schema)
+├── requirements.txt    ← anthropic, fastapi, uvicorn, pydantic
+├── Dockerfile          ← Para Railway / Render / Fly.io / Docker local
+├── .env.example        ← Template de env vars
+└── README.md           ← Este archivo
 ```
 
-Lovable va a generar algo como:
+Repo minimalista — todo el cálculo determinístico vive en el frontend Lovable (`src/lib/payout-*.ts`). Esta API es solo el adapter HTTP que llama a Claude.
 
-```typescript
-// src/lib/riskmanager.ts
-const API_URL = import.meta.env.VITE_RISKMANAGER_API_URL;
-const API_KEY = import.meta.env.VITE_RISKMANAGER_API_KEY;
+## Roadmap
 
-export interface AnalysisResult {
-  model: string;
-  phase: string | null;
-  initial_balance: number;
-  final_balance: number;
-  verdict: "PASS" | "BREACH" | "WARNING";
-  findings: Finding[];
-  payout: PayoutInfo;
-  daily_breakdown: DailyStats[];
-  metrics: Record<string, number>;
-}
-
-export interface Finding {
-  severity: "breach" | "warning" | "info";
-  rule: string;
-  detail: string;
-  date?: string;
-}
-
-export interface PayoutInfo {
-  eligible: boolean;
-  closed_profit?: number;
-  profit_split_pct?: number;
-  payout_trader_usd?: number;
-  payout_company_usd?: number;
-  blockers?: string[];
-}
-
-export async function analyzeReport(params: {
-  file: File;
-  model: "instant" | "1step" | "2step";
-  phase?: "evaluation" | "phase1" | "phase2" | "funded";
-  size?: number;
-  previousPayouts?: number;
-}): Promise<AnalysisResult> {
-  const formData = new FormData();
-  formData.append("report", params.file);
-  formData.append("model", params.model);
-  if (params.phase) formData.append("phase", params.phase);
-  if (params.size) formData.append("size", String(params.size));
-  if (params.previousPayouts) formData.append("previous_payouts", String(params.previousPayouts));
-
-  const res = await fetch(`${API_URL}/analyze`, {
-    method: "POST",
-    headers: { "X-API-Key": API_KEY },
-    body: formData,
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || "Analysis failed");
-  }
-
-  return res.json();
-}
-
-export async function narrateAnalysis(analysis: AnalysisResult): Promise<string> {
-  const res = await fetch(`${API_URL}/narrate`, {
-    method: "POST",
-    headers: {
-      "X-API-Key": API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ analysis }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || "Narration failed");
-  }
-
-  const data = await res.json();
-  return data.narration;
-}
-```
-
-### 2. UI sugerida (Lovable prompt)
-
-```
-Crear una página /review con:
-- Form para subir archivo .html (MT5 ReportHistory)
-- Select: model (instant | 1step | 2step)
-- Select condicional: phase (depende del model)
-- Input number: account size USD
-- Botón "Analizar" → llama analyzeReport()
-- Mostrar resultado:
-  - Card grande con VERDICT (color: verde PASS, amarillo WARNING, rojo BREACH)
-  - Tabla con balance inicial/final, P&L, profit %
-  - Lista de findings agrupados por severity
-  - Card de payout con monto al trader si elegible
-  - Botón "Generar reporte + email" → llama narrateAnalysis()
-  - Mostrar narración en bloque markdown render
-```
-
-### 3. Variables de entorno en Lovable
-
-En el panel de Lovable / Supabase:
-
-```
-VITE_RISKMANAGER_API_URL=https://tu-api.railway.app
-VITE_RISKMANAGER_API_KEY=<el mismo API_SECRET que pusiste en la API>
-```
-
-⚠️ **Importante sobre seguridad**: poner el API key en `VITE_*` lo expone al cliente. Para producción, mejor:
-- Hacer un Supabase Edge Function que reciba la request del frontend (autenticada con JWT del user), agregue el `X-API-Key` desde un secret, y llame a tu API Python. Así el secret nunca llega al browser.
-
-Prompt para Lovable:
-
-```
-Crear un Supabase Edge Function llamado "analyze-account" que:
-1. Reciba multipart/form-data del frontend (file + model + phase + size)
-2. Verifique JWT del usuario (Supabase Auth)
-3. Reenvíe la request a NEXT_PUBLIC_RISKMANAGER_API_URL/analyze
-   agregando el header X-API-Key desde el secret RISKMANAGER_API_KEY
-4. Devuelva la respuesta tal cual al frontend
-```
-
-## Costos estimados
-
-| Operación | Costo aproximado |
-|---|---|
-| `POST /analyze` (engine solo) | $0 (local Python) — solo costo del hosting |
-| `POST /narrate` (con agente) | ~$0.10-0.50 por revisión (depende del tamaño del JSON) |
-| `POST /full` | Igual que narrate |
-
-El engine corre en milisegundos. El agente toma 5-20 segundos.
-
-## Audit y troubleshooting
-
-### Verificar que el motor calcule bien
-
-```sh
-# Corré el local_check sobre un reporte y compará con el summary de MT5
-python local_check.py trades/<reporte>.html --model <model> --phase <phase>
-
-# La sección "Reconciliación con MT5" muestra si el P&L cuadra.
-# Si NO cuadra (✗), revisar:
-# 1. El reporte está completo (todas las posiciones)
-# 2. El modelo/phase correctos
-# 3. El size es el balance inicial real (o detectado del Deal type='balance')
-```
-
-### Logs de la API
-
-```sh
-# Local
-uvicorn api:app --reload --log-level debug
-
-# Railway / Render
-# Ver el dashboard del servicio → logs
-```
-
-### Validar setup del agente
-
-```sh
-# Listar agents existentes
-ant beta:agents list --transform '{id,name,model,version}' --format jsonl
-
-# Probar una sesión simple
-ant beta:sessions create --agent $AGENT_ID --environment-id $ENV_ID
-```
-
-## Roadmap / Cosas para iterar
-
-- [ ] Soporte para CSV/XLSX exports de otros brokers (actualmente solo HTML MT5)
-- [ ] News calendar integration para verificar trades en ventana ±5 min
-- [ ] HFT / latency detection (análisis estadístico de inter-trade timing)
-- [ ] Multi-cuenta: detectar coordinación entre accounts del mismo trader
-- [ ] Equity tick data (en lugar de solo balance al cierre) si MT5 lo expone
-- [ ] Dashboard de payouts históricos y compliance trends
+- [ ] Soporte de streaming (SSE) para mostrar el reporte mientras Claude genera
+- [ ] Cache de audits con mismo hash de input (ahorra costos si reanalyzan)
+- [ ] Webhooks para notificar BREACH automáticamente (Slack/Discord)
+- [ ] Multi-tenant (per-user `API_SECRET`)
+- [ ] Soporte explícito de Batches API para reviews masivas
 
 ## Licencia
 
-Privado — uso interno de NYS Markets.
+Privado — uso interno.
