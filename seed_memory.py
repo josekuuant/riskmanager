@@ -29,6 +29,8 @@ Uso:
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,10 +43,25 @@ MAX_MEMORY_BYTES = 100_000  # tope por memoria
 
 
 def extract_pdf(path: Path) -> str:
+    """Extract text from a PDF. Prefer pdftotext (poppler-utils); fall back to pypdf."""
+    pdftotext = shutil.which("pdftotext")
+    if pdftotext:
+        result = subprocess.run(
+            [pdftotext, "-layout", str(path), "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
     try:
         from pypdf import PdfReader
     except ImportError:
-        sys.exit("pypdf no instalado. `pip install pypdf` para procesar PDFs.")
+        sys.exit(
+            f"No puedo leer {path}. Instala UNO de:\n"
+            "  - poppler-utils  (recomendado: `brew install poppler` / `apt install poppler-utils`)\n"
+            "  - pypdf          (`pip install pypdf`)"
+        )
     reader = PdfReader(str(path))
     return "\n\n".join(p.extract_text() or "" for p in reader.pages).strip()
 

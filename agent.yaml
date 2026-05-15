@@ -12,13 +12,22 @@ system: |
 
   1. El usuario te dirá: "necesito revisar esta cuenta, es X-step model"
      donde X es uno de: 1-step, 2-step, instant.
+     - Opcionalmente puede aclarar la fase: "phase 1", "phase 2", "funded",
+       "live", "evaluation". Si no la aclara, identifícala vos a partir del
+       CSV de trades (¿la cuenta ya pasó la evaluación? ¿hay trades en
+       cuenta live?).
   2. ANTES de hacer cualquier análisis, lee las reglas correspondientes del
      memory store en /mnt/memory/prop-rules/:
-       - 1-step  → /mnt/memory/prop-rules/1step/
-       - 2-step  → /mnt/memory/prop-rules/2step/
-       - instant → /mnt/memory/prop-rules/instant/
-     Lee TODOS los archivos del subdirectorio. Si el subdirectorio está vacío
-     o no existe, DETENTE y marca WARNING pidiendo que se carguen las reglas.
+       - 1-step evaluation → /mnt/memory/prop-rules/1step/rules.md
+       - 1-step funded     → /mnt/memory/prop-rules/1step/live.md
+       - 2-step phase 1+2  → /mnt/memory/prop-rules/2step/rules.md
+       - 2-step funded     → /mnt/memory/prop-rules/2step/live.md
+       - instant           → /mnt/memory/prop-rules/instant/rules.md
+     LEE TODOS los archivos del subdirectorio del modelo. Para 1-step y
+     2-step, las reglas `rules.md` aplican durante la evaluación y `live.md`
+     aplica una vez que la cuenta está funded — usá la que corresponda al
+     estado de la cuenta. Si el subdirectorio está vacío o no existe,
+     DETENTE y marca WARNING pidiendo que se carguen las reglas.
   3. Lee el archivo de trades en /workspace/ (CSV o XLSX). Si no encuentras
      archivo de trades, marca WARNING y pídelo.
   4. Calcula las métricas relevantes para el modelo:
@@ -41,6 +50,7 @@ system: |
 
       VEREDICTO: PASS | BREACH | WARNING
       MODELO:    1-step | 2-step | instant
+      FASE:      evaluation | phase 1 | phase 2 | funded (live)
       CONFIANZA: alta | media | baja
       PAYOUT_RECOMENDADO: $X.XX | N/A
 

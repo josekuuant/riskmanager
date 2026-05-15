@@ -32,6 +32,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("model", choices=sorted(VALID_MODELS))
     parser.add_argument("trades", type=Path, help="CSV o XLSX con el historial de trades")
     parser.add_argument(
+        "--phase",
+        choices=["evaluation", "phase1", "phase2", "funded"],
+        help=(
+            "Fase de la cuenta. Para 1-step/2-step: evaluation|phase1|phase2|funded. "
+            "Si se omite, el agente la detecta del CSV. instant no usa este flag."
+        ),
+    )
+    parser.add_argument(
         "--save-outputs",
         type=Path,
         default=Path("./outputs"),
@@ -86,9 +94,10 @@ def main() -> None:
 
     # 3. Stream-first: abrir stream ANTES de enviar el kickoff
     full_response: list[str] = []
+    phase_note = f" ({args.phase})" if args.phase else ""
     kickoff = (
-        f"hello necesito revisar esta cuenta, es {MODEL_LABEL[args.model]} model. "
-        f"Los trades están en /workspace/{args.trades.name}."
+        f"hello necesito revisar esta cuenta, es {MODEL_LABEL[args.model]} model"
+        f"{phase_note}. Los trades están en /workspace/{args.trades.name}."
     )
 
     with client.beta.sessions.events.stream(session_id=session.id) as stream:
