@@ -1,275 +1,174 @@
-"""Verifica localmente un reporte MT5 antes de gastar una sesión del agente.
+"""Verifica un reporte MT5 contra las reglas NYS — TODO determinístico, sin LLM.
 
-Parsea el HTML de MetaTrader 5 ReportHistory, extrae los trades cerrados,
-detecta el balance inicial, y calcula las métricas críticas:
-  - P&L día a día
-  - Daily drawdown (% sobre balance al inicio del día)
-  - Drawdown total acumulado
-  - Reconciliación del balance final reportado
-
-NO emite veredicto — solo muestra las cifras que el agente va a usar. Si
-estos números coinciden con lo que esperás, el agente debería emitir el
-mismo veredicto que harías vos manualmente.
+Corre el rules_engine.py contra el HTML parseado y muestra:
+  - Métricas calculadas (balance, P&L, DD, profit target, etc.)
+  - Cada regla evaluada (PASS / WARNING / BREACH) con evidencia
+  - Veredicto final
+  - Reconciliación contra el summary del propio MT5
 
 Uso:
-    pip install beautifulsoup4
-    python local_check.py <archivo.html>
+    pip install beautifulsoup4 lxml
+    python local_check.py <reporte.html> --model <m> [--phase <p>]
+                          [--size <usd>] [--server-utc-offset <horas>]
+                          [--json]
 
-Ejemplo:
-    python local_check.py ./trades/ReportHistory9708.html
+Ejemplos:
+    python local_check.py trades/ReportHistory9708.html --model instant --size 10000
+    python local_check.py trades/cuenta.html --model 2step --phase phase1
+    python local_check.py trades/x.html --model 1step --phase funded --json > out.json
 """
 
 import argparse
-import re
+import json
 import sys
-from collections import defaultdict
-from dataclasses import dataclass
-from datetime import date, datetime
 from pathlib import Path
 
-
-@dataclass
-class Trade:
-    close_time: datetime
-    symbol: str
-    side: str           # buy | sell
-    volume: float
-    open_price: float
-    close_price: float
-    commission: float
-    swap: float
-    profit: float
-
-    @property
-    def net_pnl(self) -> float:
-        return self.profit + self.commission + self.swap
+from mt5_parser import parse, parse_number, read_html
+from rules_engine import RULES, evaluate, to_json
 
 
-def read_html(path: Path) -> str:
-    """MT5 exports as UTF-16-LE with BOM. Fall back to UTF-8 if no BOM."""
-    raw = path.read_bytes()
-    if raw[:2] == b"\xff\xfe":
-        return raw.decode("utf-16")
-    if raw[:2] == b"\xfe\xff":
-        return raw.decode("utf-16-be")
-    return raw.decode("utf-8", errors="replace")
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("report", type=Path)
+    p.add_argument("--model", required=True, choices=["instant", "1step", "2step"])
+    p.add_argument(
+        "--phase",
+        choices=["evaluation", "phase1", "phase2", "funded"],
+        help="Para 1-step: evaluation|funded. Para 2-step: phase1|phase2|funded. Instant: omitir.",
+    )
+    p.add_argument("--size", type=int, help="Tamaño cuenta en USD; si se omite, se detecta del reporte")
+    p.add_argument("--server-utc-offset", type=int, default=0,
+                   help="Offset horario del server MT5 vs UTC (default 0)")
+    p.add_argument("--json", action="store_true", help="Output JSON puro (para feeding al agente)")
+    return p.parse_args()
 
 
-def parse_number(s: str) -> float:
-    """MT5 uses thousands-separator with non-breaking spaces or regular spaces."""
-    return float(s.replace("\xa0", "").replace(" ", "").replace(",", "."))
+def normalize_phase(model: str, phase: str | None) -> str | None:
+    if model == "instant":
+        return None
+    if model == "1step":
+        if phase in (None, "evaluation"):
+            return "evaluation"
+        if phase == "funded":
+            return "funded"
+        sys.exit(f"Fase inválida para 1-step: {phase} (válidas: evaluation, funded)")
+    if model == "2step":
+        if phase in ("phase1", "phase2", "funded"):
+            return phase
+        sys.exit(f"Fase requerida para 2-step: phase1 | phase2 | funded")
+    return phase
 
 
-def parse(html: str) -> tuple[float, list[Trade], dict[str, str]]:
-    """Return (initial_balance, trades, summary_metrics)."""
-    from bs4 import BeautifulSoup
+def print_human(html: str, result, summary: dict[str, str]) -> None:
+    """Imprime resultado en formato legible para humanos."""
+    print(f"\n╔══════════════════════════════════════════════════════════════════════════════╗")
+    print(f"║  RISK MANAGER — {result.model.upper():<8} {(result.phase or '').upper():<10}                                    ║")
+    print(f"╚══════════════════════════════════════════════════════════════════════════════╝\n")
 
-    soup = BeautifulSoup(html, "lxml")
-    rows = soup.find_all("tr")
+    print(f"Balance inicial:    ${result.initial_balance:>12,.2f}")
+    print(f"Balance final:      ${result.final_balance:>12,.2f}  "
+          f"(P&L: ${result.metrics['total_pnl']:+,.2f}  "
+          f"{result.metrics['total_pnl_pct']:+.2f}%)")
+    print(f"Trades:             {result.n_trades:>13}")
+    print(f"Trading days:       {result.metrics['n_trading_days']:>13}")
+    if result.period_start:
+        print(f"Período:            {result.period_start:%Y-%m-%d} → {result.period_end:%Y-%m-%d}")
 
-    initial_balance = None
-    trades: list[Trade] = []
-    summary: dict[str, str] = {}
-
-    current_section = None
-    for tr in rows:
-        cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
-        if not cells:
-            continue
-        text = " ".join(cells).lower()
-
-        # Section markers
-        if "positions" in text and len(cells) == 1:
-            current_section = "positions"
-            continue
-        if "orders" in text and len(cells) == 1:
-            current_section = "orders"
-            continue
-        if cells[0].lower() == "deals" and len(cells) == 1:
-            current_section = "deals"
-            continue
-        if "results" in text and len(cells) == 1:
-            current_section = "results"
-            continue
-
-        # Initial balance row (Deals section, type='balance' + comment "initial")
-        if "balance" in [c.lower() for c in cells] and "initial" in tr.get_text().lower():
-            # Comment cell mentions "initial"; the Balance value is the cell
-            # immediately before it. (MT5 Deal layout: ... Profit, Balance, Comment.)
-            comment_idx = next(
-                (i for i, c in enumerate(cells) if "initial" in c.lower()),
-                None,
-            )
-            if comment_idx and comment_idx >= 2:
-                try:
-                    initial_balance = parse_number(cells[comment_idx - 1])
-                except ValueError:
-                    pass
-            continue
-
-        # Closed positions: 14 cells with cells[3] = buy/sell. There is a
-        # hidden <td colspan="8"> at cells[4] (BeautifulSoup sees it as empty
-        # text), so the real data is offset by one from what naive indexing
-        # would suggest. Layout:
-        #   0=OpenTime 1=Position 2=Symbol 3=Type 4=(hidden) 5=Volume
-        #   6=OpenPrice 7=S/L 8=T/P 9=CloseTime 10=ClosePrice
-        #   11=Commission 12=Swap 13=Profit
-        if current_section == "positions" and len(cells) >= 14:
-            if cells[3].lower() in {"buy", "sell"}:
-                try:
-                    close_time = datetime.strptime(cells[9], "%Y.%m.%d %H:%M:%S")
-                    trades.append(
-                        Trade(
-                            close_time=close_time,
-                            symbol=cells[2],
-                            side=cells[3].lower(),
-                            volume=parse_number(cells[5]),
-                            open_price=parse_number(cells[6]),
-                            close_price=parse_number(cells[10]),
-                            commission=parse_number(cells[11]),
-                            swap=parse_number(cells[12]),
-                            profit=parse_number(cells[13]),
-                        )
-                    )
-                except (ValueError, IndexError):
-                    pass
-            continue
-
-        # Summary metrics (Results section): pairs of label: value
-        if current_section == "results" and len(cells) >= 2:
-            # MT5 packs label / value pairs into the same row sometimes
-            for i in range(0, len(cells) - 1, 2):
-                label = cells[i].rstrip(":").strip()
-                value = cells[i + 1].strip()
-                if label and value and len(label) < 60:
-                    summary.setdefault(label, value)
-
-    if initial_balance is None:
-        raise ValueError("No pude encontrar el balance inicial en la sección Deals")
-    trades.sort(key=lambda t: t.close_time)
-    return initial_balance, trades, summary
-
-
-def daily_breakdown(initial_balance: float, trades: list[Trade]) -> list[dict]:
-    """Group trades by close date and compute running balance + daily DD."""
-    by_day: dict[date, list[Trade]] = defaultdict(list)
-    for t in trades:
-        by_day[t.close_time.date()].append(t)
-
-    rows = []
-    running = initial_balance
-    peak = initial_balance
-    for day in sorted(by_day):
-        day_trades = by_day[day]
-        open_bal = running
-        day_pnl = sum(t.net_pnl for t in day_trades)
-        running = open_bal + day_pnl
-        peak = max(peak, running)
-        daily_pct = (day_pnl / open_bal) * 100 if open_bal else 0.0
-        total_dd_pct = ((peak - running) / peak) * 100 if peak else 0.0
-        rows.append(
-            {
-                "date": day,
-                "n_trades": len(day_trades),
-                "open_balance": open_bal,
-                "day_pnl": day_pnl,
-                "close_balance": running,
-                "daily_pct": daily_pct,
-                "running_peak": peak,
-                "total_dd_pct": total_dd_pct,
-            }
+    print("\nDía         #tr   open$        P&L$    close$    daily%    peak$    DD-peak%   trailing$")
+    print("─" * 100)
+    for d in result.daily_breakdown:
+        flag = ""
+        if abs(d.daily_pct) >= result.rules_applied.get("daily_loss_pct", 999) and d.daily_pct < 0:
+            flag += " ⚠DAILY"
+        if result.rules_applied.get("drawdown_type") == "trailing" and d.close_balance < d.trailing_dd_limit:
+            flag += " ⚠TRAIL"
+        dd_peak_pct = (1 - d.close_balance / d.running_peak) * 100 if d.running_peak else 0
+        trailing_str = f"{d.trailing_dd_limit:>9,.2f}" if d.trailing_dd_limit > 0 else "—"
+        print(
+            f"{d.trading_day}  {d.n_trades:>3}  "
+            f"{d.open_balance:>9,.2f}  {d.day_pnl:>+9,.2f}  "
+            f"{d.close_balance:>9,.2f}  {d.daily_pct:>+6.2f}%  "
+            f"{d.running_peak:>9,.2f}  {dd_peak_pct:>6.2f}%   {trailing_str}{flag}"
         )
-    return rows
+
+    # Findings
+    print("\n" + "─" * 100)
+    print("REGLAS EVALUADAS\n")
+    by_severity = {"breach": [], "warning": [], "info": []}
+    for f in result.findings:
+        by_severity[f.severity].append(f)
+
+    if by_severity["breach"]:
+        print("✗ BREACHES")
+        for f in by_severity["breach"]:
+            print(f"  → {f.rule}")
+            print(f"     {f.detail}\n")
+    if by_severity["warning"]:
+        print("⚠ WARNINGS")
+        for f in by_severity["warning"]:
+            print(f"  → {f.rule}")
+            print(f"     {f.detail}\n")
+    if by_severity["info"]:
+        print("✓ INFO")
+        for f in by_severity["info"]:
+            print(f"  → {f.rule}: {f.detail}")
+
+    # Veredicto
+    print("\n" + "═" * 100)
+    color = {"PASS": "✓", "WARNING": "⚠", "BREACH": "✗"}
+    print(f"\n  {color[result.verdict]}  VEREDICTO: {result.verdict}\n")
+    print("═" * 100)
+
+    # Reconciliación con MT5
+    if "Total Net Profit" in summary:
+        reported = parse_number(summary["Total Net Profit"])
+        calc = result.metrics["total_pnl"]
+        diff = abs(reported - calc)
+        match = "✓" if diff < 0.5 else "✗"
+        print(f"\nReconciliación con MT5: reporta ${reported:+,.2f} / calculado ${calc:+,.2f}  {match}")
+
+    if "Balance Drawdown Maximal" in summary:
+        print(f"MT5 reporta Balance DD: {summary['Balance Drawdown Maximal']}")
+        print(f"Calculado DD desde peak: {result.metrics['max_drawdown_from_peak_pct']:.2f}%")
+        print("  (diferencia esperada: MT5 mide equity intraday; aquí solo balance al cierre)")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("report", type=Path, help="Ruta al MT5 ReportHistory.html")
-    parser.add_argument(
-        "--daily-limit",
-        type=float,
-        default=3.0,
-        help="Límite de daily loss en %% (default 3 — aplica a instant y 1-step)",
-    )
-    parser.add_argument(
-        "--total-limit",
-        type=float,
-        default=5.0,
-        help="Límite de pérdida total en %% (default 5 — ajustá según las reglas exactas)",
-    )
-    args = parser.parse_args()
-
+    args = parse_args()
     if not args.report.is_file():
-        sys.exit(f"No existe el archivo: {args.report}")
+        sys.exit(f"No existe: {args.report}")
+
+    phase = normalize_phase(args.model, args.phase)
+    if (args.model, phase) not in RULES and args.model != "instant":
+        sys.exit(f"Combinación no soportada: model={args.model} phase={phase}")
 
     html = read_html(args.report)
     initial_balance, trades, summary = parse(html)
 
-    print(f"=== {args.report.name} ===\n")
-    print(f"Balance inicial:    ${initial_balance:>12,.2f}")
-    print(f"Trades cerrados:    {len(trades):>13}")
-    if trades:
-        print(f"Primer trade:       {trades[0].close_time:%Y-%m-%d %H:%M}")
-        print(f"Último trade:       {trades[-1].close_time:%Y-%m-%d %H:%M}")
+    if args.size:
+        if abs(args.size - initial_balance) > 1:
+            print(
+                f"⚠ Override: --size ${args.size:,} sobrescribe balance detectado "
+                f"${initial_balance:,.2f}",
+                file=sys.stderr,
+            )
+        initial_balance = float(args.size)
 
-    rows = daily_breakdown(initial_balance, trades)
+    result = evaluate(
+        model=args.model,
+        phase=phase,
+        initial_balance=initial_balance,
+        trades=trades,
+        server_utc_offset_hours=args.server_utc_offset,
+    )
 
-    # Tabla día a día
-    print("\nDía         #tr    open$        P&L$    close$    daily%   peak$   totalDD%")
-    print("─" * 82)
-    worst_daily = None
-    worst_total = None
-    for r in rows:
-        flag = ""
-        if abs(r["daily_pct"]) >= args.daily_limit and r["daily_pct"] < 0:
-            flag += " ⚠DAILY"
-        if r["total_dd_pct"] >= args.total_limit:
-            flag += " ⚠TOTAL"
-        print(
-            f"{r['date']}  {r['n_trades']:>3}  "
-            f"{r['open_balance']:>9,.2f}  {r['day_pnl']:>+9,.2f}  "
-            f"{r['close_balance']:>9,.2f}  {r['daily_pct']:>+6.2f}%  "
-            f"{r['running_peak']:>9,.2f}  {r['total_dd_pct']:>5.2f}%{flag}"
-        )
-        if r["daily_pct"] < 0 and (worst_daily is None or r["daily_pct"] < worst_daily["daily_pct"]):
-            worst_daily = r
-        if worst_total is None or r["total_dd_pct"] > worst_total["total_dd_pct"]:
-            worst_total = r
-
-    print()
-    print("─" * 82)
-    if worst_daily:
-        print(
-            f"Peor daily DD:   {worst_daily['daily_pct']:+.2f}% el "
-            f"{worst_daily['date']}  (${worst_daily['day_pnl']:+,.2f})"
-            f"  límite: -{args.daily_limit}%   "
-            + ("✗ BREACH" if abs(worst_daily['daily_pct']) >= args.daily_limit else "✓ OK")
-        )
-    if worst_total:
-        print(
-            f"Peor total DD:   {worst_total['total_dd_pct']:.2f}% al "
-            f"{worst_total['date']}  límite: {args.total_limit}%   "
-            + ("✗ BREACH" if worst_total["total_dd_pct"] >= args.total_limit else "✓ OK")
-        )
-    final_balance = rows[-1]["close_balance"] if rows else initial_balance
-    print(f"Balance final:   ${final_balance:>12,.2f}  (P&L total: ${final_balance - initial_balance:+,.2f})")
-
-    # Reconciliar con el summary del propio MT5
-    if "Total Net Profit" in summary:
-        reported = parse_number(summary["Total Net Profit"])
-        calculated = final_balance - initial_balance
-        diff = abs(reported - calculated)
-        match = "✓" if diff < 0.5 else "✗"
-        print(f"\nReconciliación:  MT5 reporta Net Profit ${reported:+,.2f}  /  calculado ${calculated:+,.2f}  {match}")
-
-    print("\nSummary MT5 (extracto):")
-    for k in [
-        "Total Net Profit", "Profit Factor", "Balance Drawdown Maximal",
-        "Total Trades", "Profit Trades (% of total)", "Loss Trades (% of total)",
-        "Maximum consecutive losses ($)",
-    ]:
-        if k in summary:
-            print(f"  {k:32s} {summary[k]}")
+    if args.json:
+        # JSON-only output: para feeding al agente
+        out = result.to_dict()
+        out["mt5_summary"] = summary
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print_human(html, result, summary)
 
 
 if __name__ == "__main__":
