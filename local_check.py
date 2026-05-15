@@ -39,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--size", type=int, help="Tamaño cuenta en USD; si se omite, se detecta del reporte")
     p.add_argument("--server-utc-offset", type=int, default=0,
                    help="Offset horario del server MT5 vs UTC (default 0)")
+    p.add_argument("--previous-payouts", type=int, default=0,
+                   help="Cantidad de payouts previos aprobados (afecta split: 80%% → 90%% tras 3)")
     p.add_argument("--json", action="store_true", help="Output JSON puro (para feeding al agente)")
     return p.parse_args()
 
@@ -132,6 +134,31 @@ def print_human(html: str, result, summary: dict[str, str]) -> None:
         print(f"Calculado DD desde peak: {result.metrics['max_drawdown_from_peak_pct']:.2f}%")
         print("  (diferencia esperada: MT5 mide equity intraday; aquí solo balance al cierre)")
 
+    # Payout
+    p = result.payout
+    if p:
+        print("\n" + "─" * 100)
+        print("PAYOUT")
+        print("─" * 100)
+        if p.get("eligible"):
+            print(f"  ✓ ELEGIBLE")
+            print(f"  Profit cerrado:        ${p['closed_profit']:>+10,.2f}  ({p['closed_profit_pct']:+.2f}%)")
+            print(f"  Profit split:           {p['profit_split_pct']}%")
+            print(f"  Trader recibe:         ${p['payout_trader_usd']:>+10,.2f}")
+            print(f"  Empresa retiene:       ${p['payout_company_usd']:>+10,.2f}")
+            if p.get("min_payout_usd"):
+                print(f"  Min payout:            ${p['min_payout_usd']}")
+            print(f"  Días desde 1er trade:   {p['days_since_first_trade']}  (mínimo {p.get('min_days_required','?')})")
+        else:
+            print(f"  ✗ NO ELEGIBLE")
+            if "reason" in p:
+                print(f"  Razón: {p['reason']}")
+            for blocker in p.get("blockers", []):
+                print(f"    - {blocker}")
+            if "closed_profit" in p:
+                print(f"\n  Profit cerrado: ${p['closed_profit']:+,.2f}")
+                print(f"  Días desde 1er trade: {p['days_since_first_trade']}")
+
 
 def main() -> None:
     args = parse_args()
@@ -160,6 +187,7 @@ def main() -> None:
         initial_balance=initial_balance,
         trades=trades,
         server_utc_offset_hours=args.server_utc_offset,
+        n_previous_payouts=args.previous_payouts,
     )
 
     if args.json:

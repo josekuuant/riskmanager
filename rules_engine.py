@@ -244,6 +244,7 @@ class EngineResult:
     findings: list[Finding]
     metrics: dict
     verdict: Literal["PASS", "BREACH", "WARNING"]
+    payout: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -265,6 +266,7 @@ class EngineResult:
             "findings": [f.to_dict() for f in self.findings],
             "metrics": self.metrics,
             "verdict": self.verdict,
+            "payout": self.payout,
         }
 
 
@@ -708,17 +710,28 @@ def check_exposure_per_symbol(
     for symbol, (ts, peak_exp) in sorted(worst_per_symbol.items()):
         if peak_exp > limit_usd:
             cs = contract_size(symbol)
-            severity = "breach" if peak_exp > limit_usd * 1.5 else "warning"
+            # Exposure SIEMPRE es WARNING — la regla del PDF dice "may be
+            # considered violation" + acción típica es "request reduction",
+            # no auto-close. Además, sin S/L data no podemos calcular el
+            # "risk-at-stake" real, que es probablemente la métrica correcta.
+            # El cálculo de margen comprometido es un upper bound conservador.
+            # Para BREACH definitivo: revisión humana con risk-at-stake real
+            # o confirmación del criterio que usa la firma.
+            extreme = peak_exp > limit_usd * 3
             findings.append(Finding(
-                severity=severity,
-                rule=f"Max Exposure per Symbol ({max_pct}%)",
+                severity="warning",
+                rule=f"Max Exposure per Symbol ({max_pct}%){'  [EXTREMO]' if extreme else ''}",
                 detail=(
                     f"Pico de margen comprometido en {symbol}: ${peak_exp:,.2f} "
-                    f"el {ts:%Y-%m-%d %H:%M} — excede ${limit_usd:,.2f} ({max_pct}% "
-                    f"del initial ${initial_balance:,.2f}). Cálculo: notional "
-                    f"(volume × {cs:g} × price) ÷ {max_lev} (max leverage del modelo). "
-                    "Si la firma usa otra métrica (notional bruto, risk-at-stake "
-                    "con SL), ajustar interpretación."
+                    f"({peak_exp/initial_balance*100:.1f}% del initial) el "
+                    f"{ts:%Y-%m-%d %H:%M}. Límite documentado: ${limit_usd:,.2f} "
+                    f"({max_pct}%). Cálculo: notional (volume × {cs:g} × price) "
+                    f"÷ {max_lev} (max leverage). NOTA: la regla del PDF dice "
+                    "'may be considered violation' y la acción típica es "
+                    "'request reduction', no auto-close. El motor flagea como "
+                    "WARNING — revisión humana decide. Para análisis preciso, "
+                    "extender parser para capturar S/L y calcular risk-at-stake."
+                    + (f" RATIO MUY ALTO ({peak_exp/limit_usd:.1f}× el límite) — revisar." if extreme else "")
                 ),
                 date=ts.date(),
                 actual=peak_exp,
@@ -791,12 +804,123 @@ def check_trade_ideas(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def compute_payout(
+    model: Model,
+    phase: Optional[Phase],
+    initial_balance: float,
+    daily: list[DailyStats],
+    trades: list[Trade],
+    findings: list[Finding],
+    n_previous_payouts: int = 0,
+) -> dict:
+    """Calcula payout aplicable según reglas NYS.
+
+    Live (funded):
+      - Profit split: 80% (90% después de 3 payouts exitosos, 100% después
+        de 3 meses consecutivos rentables — esto último no se chequea aquí)
+      - Min payout: $100
+      - Primer payout: 14 días desde activación → día 15
+      - Después: cada martes
+
+    Instant:
+      - Min profit 3% del initial para payout
+      - Primer payout: 30 días desde primer trade
+      - Después: cada 14 días
+    """
+    if not daily or not trades:
+        return {"eligible": False, "reason": "no hay trades para evaluar payout"}
+
+    final_balance = daily[-1].close_balance
+    closed_profit = final_balance - initial_balance
+    first_trade = min(t.open_time for t in trades)
+    last_trade = max(t.close_time for t in trades)
+    days_since_first = (last_trade.date() - first_trade.date()).days
+
+    blockers: list[str] = []
+    # Cualquier breach bloquea payout
+    breaches = [f for f in findings if f.severity == "breach"]
+    if breaches:
+        blockers.extend(f"BREACH: {b.rule}" for b in breaches)
+
+    # Warnings que bloquean payout específicamente
+    blocking_warnings = [
+        "15.0% Consistency",
+        "Min Profitable Days",
+    ]
+    for f in findings:
+        if f.severity == "warning":
+            for bw in blocking_warnings:
+                if bw in f.rule:
+                    blockers.append(f"BLOQUEO: {f.rule}")
+
+    result: dict = {
+        "model": model,
+        "phase": phase,
+        "closed_profit": closed_profit,
+        "closed_profit_pct": closed_profit / initial_balance * 100,
+        "first_trade_date": first_trade.isoformat(),
+        "last_trade_date": last_trade.isoformat(),
+        "days_since_first_trade": days_since_first,
+        "n_previous_payouts": n_previous_payouts,
+    }
+
+    if model == "instant":
+        # Instant rules
+        min_profit_usd = initial_balance * 0.03  # 3%
+        result["min_profit_required"] = min_profit_usd
+        result["meets_min_profit"] = closed_profit >= min_profit_usd
+        result["min_days_required"] = 30
+        result["meets_min_days"] = days_since_first >= 30
+        result["profit_split_pct"] = 80  # instant: 80% siempre
+        if closed_profit < min_profit_usd:
+            blockers.append(f"Profit ${closed_profit:,.2f} bajo el mínimo ${min_profit_usd:,.2f} (3%)")
+        if days_since_first < 30:
+            blockers.append(f"Solo {days_since_first} días desde primer trade — se requieren 30 para primer payout")
+    else:
+        # Live (funded) rules
+        if phase != "funded":
+            return {
+                "eligible": False,
+                "reason": f"Payouts solo aplican en fase funded (actual: {phase})",
+                **result,
+            }
+        result["min_payout_usd"] = 100
+        result["min_days_required"] = 14
+        result["meets_min_days"] = days_since_first >= 14
+        # Profit split escalado
+        if n_previous_payouts >= 3:
+            result["profit_split_pct"] = 90
+        else:
+            result["profit_split_pct"] = 80
+        if days_since_first < 14:
+            blockers.append(f"Solo {days_since_first} días desde primer trade — se requieren 14 para primer payout")
+        if closed_profit < 100:
+            blockers.append(f"Profit ${closed_profit:,.2f} bajo el minimum payout de $100")
+
+    # Trades abiertos al momento de pedir payout — no soportado: el report
+    # ya está cerrado, asumimos no hay positions abiertas
+    result["has_open_trades"] = False  # asunción — el reporte muestra Positions cerradas
+
+    # Cálculo del payout
+    split = result["profit_split_pct"] / 100
+    trader_amount = max(0, closed_profit * split) if closed_profit > 0 else 0
+    company_amount = max(0, closed_profit - trader_amount) if closed_profit > 0 else 0
+
+    result["payout_trader_usd"] = trader_amount
+    result["payout_company_usd"] = company_amount
+    result["blockers"] = blockers
+    result["eligible"] = len(blockers) == 0 and closed_profit > 0
+
+    return result
+
+
 def evaluate(
     model: Model,
     phase: Optional[Phase],
     initial_balance: float,
     trades: list[Trade],
     server_utc_offset_hours: int = 0,
+    n_previous_payouts: int = 0,
 ) -> EngineResult:
     """Corre todas las reglas aplicables y devuelve resultado estructurado."""
     key = (model, phase if model != "instant" else None)
@@ -841,6 +965,17 @@ def evaluate(
         ),
     }
 
+    # Payout (solo si la fase lo permite — instant o funded)
+    payout = compute_payout(
+        model=model,
+        phase=phase,
+        initial_balance=initial_balance,
+        daily=daily,
+        trades=trades,
+        findings=findings,
+        n_previous_payouts=n_previous_payouts,
+    )
+
     return EngineResult(
         model=model,
         phase=phase,
@@ -854,6 +989,7 @@ def evaluate(
         findings=findings,
         metrics=metrics,
         verdict=verdict,
+        payout=payout,
     )
 
 
