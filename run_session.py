@@ -1,70 +1,103 @@
-"""Run one session against the Risk & Compliance Agent.
+"""Revisa una cuenta de prop firm contra las reglas del modelo.
 
-Setup (one-time, run via ant CLI — see README in chat):
-  export AGENT_ID=$(ant beta:agents create < agent.yaml --transform id -r)
-  export ENV_ID=$(ant beta:environments create < environment.yaml --transform id -r)
+Uso:
+    export ANTHROPIC_API_KEY=...
+    # Variables de setup (ver setup en chat / .env.example):
+    export AGENT_ID=agent_...
+    export ENV_ID=env_...
+    export MEMORY_STORE_ID=memstore_...
 
-Runtime: this script loads AGENT_ID + ENV_ID from env, optionally uploads files,
-opens an SSE stream, sends the kickoff message, and drains until idle/terminated.
+    python run_session.py <modelo> <ruta-al-csv-de-trades>
+
+Ejemplo:
+    python run_session.py 2step ./trades/account_98423.xlsx
+
+<modelo> debe ser uno de: 1step, 2step, instant
 """
 
+import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
 import anthropic
 
-AGENT_ID = os.environ["AGENT_ID"]
-ENV_ID = os.environ["ENV_ID"]
+VALID_MODELS = {"1step", "2step", "instant"}
+MODEL_LABEL = {"1step": "1-step", "2step": "2-step", "instant": "instant"}
 
-# Files to mount into the session container at /workspace/<name>.
-# Add paths here (or wire this up to whatever drives a real review).
-FILES_TO_MOUNT: list[Path] = [
-    # Path("./inputs/control_matrix.xlsx"),
-    # Path("./inputs/policy.pdf"),
-]
 
-KICKOFF_MESSAGE = "Hello — await further instructions."
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model", choices=sorted(VALID_MODELS))
+    parser.add_argument("trades", type=Path, help="CSV o XLSX con el historial de trades")
+    parser.add_argument(
+        "--save-outputs",
+        type=Path,
+        default=Path("./outputs"),
+        help="Directorio donde guardar el reporte y el email (default: ./outputs)",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
+    args = parse_args()
+    if not args.trades.is_file():
+        sys.exit(f"No existe el archivo de trades: {args.trades}")
+
+    agent_id = os.environ["AGENT_ID"]
+    env_id = os.environ["ENV_ID"]
+    memory_store_id = os.environ["MEMORY_STORE_ID"]
+
     client = anthropic.Anthropic()
 
-    # 1. Upload each file via the Files API; collect resource entries.
-    resources = []
-    for path in FILES_TO_MOUNT:
-        with path.open("rb") as f:
-            uploaded = client.beta.files.upload(file=f)
-        resources.append(
+    # 1. Subir el CSV/XLSX de trades
+    with args.trades.open("rb") as f:
+        uploaded = client.beta.files.upload(file=f)
+    print(f"✓ Trades subidos: {uploaded.id}")
+
+    # 2. Crear la sesión con memory store (reglas, read-only) + archivo de trades
+    session = client.beta.sessions.create(
+        agent=agent_id,
+        environment_id=env_id,
+        title=f"Revisión {MODEL_LABEL[args.model]} — {args.trades.name}",
+        resources=[
+            {
+                "type": "memory_store",
+                "memory_store_id": memory_store_id,
+                "access": "read_only",
+                "instructions": (
+                    f"Reglas del prop firm. Lee TODOS los archivos en "
+                    f"/{args.model}/ ANTES de evaluar la cuenta."
+                ),
+            },
             {
                 "type": "file",
                 "file_id": uploaded.id,
-                "mount_path": f"/workspace/{path.name}",
-            }
-        )
-
-    # 2. Create the session (references the pre-created agent by ID).
-    session = client.beta.sessions.create(
-        agent=AGENT_ID,
-        environment_id=ENV_ID,
-        title="Compliance review run",
-        resources=resources,
+                "mount_path": f"/workspace/{args.trades.name}",
+            },
+        ],
     )
-    print(f"Session: {session.id}")
+    print(f"✓ Sesión: {session.id}")
     print(
-        f"Watch in Console: https://platform.claude.com/workspaces/default/sessions/{session.id}",
+        f"  Console: https://platform.claude.com/workspaces/default/sessions/{session.id}",
         flush=True,
     )
 
-    # 3. Stream-first: open the stream BEFORE sending the kickoff so we don't
-    #    miss early events. Then send the user message while the stream is live.
+    # 3. Stream-first: abrir stream ANTES de enviar el kickoff
+    full_response: list[str] = []
+    kickoff = (
+        f"hello necesito revisar esta cuenta, es {MODEL_LABEL[args.model]} model. "
+        f"Los trades están en /workspace/{args.trades.name}."
+    )
+
     with client.beta.sessions.events.stream(session_id=session.id) as stream:
         client.beta.sessions.events.send(
             session_id=session.id,
             events=[
                 {
                     "type": "user.message",
-                    "content": [{"type": "text", "text": KICKOFF_MESSAGE}],
+                    "content": [{"type": "text", "text": kickoff}],
                 }
             ],
         )
@@ -75,32 +108,42 @@ def main() -> None:
                     if block.type == "text":
                         sys.stdout.write(block.text)
                         sys.stdout.flush()
+                        full_response.append(block.text)
             elif event.type == "agent.tool_use":
                 print(f"\n[tool] {event.name}", flush=True)
             elif event.type == "session.status_terminated":
-                print("\n[session terminated]", flush=True)
+                print("\n[sesión terminada]", flush=True)
                 break
             elif event.type == "session.status_idle":
-                # Break only on terminal stop_reason. requires_action means the
-                # agent is waiting on a tool confirmation / custom tool result.
+                # Romper solo si el stop_reason es terminal. requires_action
+                # significa que está esperando algo del cliente — seguir.
                 if event.stop_reason.type == "requires_action":
                     continue
-                print(
-                    f"\n[idle: {event.stop_reason.type}]",
-                    flush=True,
-                )
+                print(f"\n[idle: {event.stop_reason.type}]", flush=True)
                 break
 
-    # 4. Optionally pull files the agent wrote to /mnt/session/outputs/.
-    outputs_dir = Path("./outputs")
-    outputs_dir.mkdir(exist_ok=True)
-    for f in client.beta.files.list(
-        scope_id=session.id,
-        betas=["managed-agents-2026-04-01"],
-    ):
-        print(f"Output: {f.filename} ({f.size_bytes} bytes)")
-        content = client.beta.files.download(f.id)
-        content.write_to_file(outputs_dir / f.filename)
+    # 4. Guardar outputs separados (veredicto, reporte interno, email)
+    args.save_outputs.mkdir(parents=True, exist_ok=True)
+    full_text = "".join(full_response)
+    stem = args.trades.stem
+
+    (args.save_outputs / f"{stem}_full.md").write_text(full_text, encoding="utf-8")
+
+    verdict = extract_verdict(full_text)
+    if verdict:
+        (args.save_outputs / f"{stem}_verdict.txt").write_text(verdict, encoding="utf-8")
+        print(f"\n→ Veredicto guardado: {args.save_outputs / f'{stem}_verdict.txt'}")
+    print(f"→ Respuesta completa: {args.save_outputs / f'{stem}_full.md'}")
+
+
+def extract_verdict(text: str) -> str | None:
+    """Extrae el bloque de veredicto del output del agente."""
+    match = re.search(
+        r"VEREDICTO:\s*\w+.*?PAYOUT_RECOMENDADO:\s*[^\n]+",
+        text,
+        re.DOTALL,
+    )
+    return match.group(0).strip() if match else None
 
 
 if __name__ == "__main__":
