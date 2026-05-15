@@ -2,6 +2,6 @@
 __pycache__/
 *.pyc
 outputs/
-inputs/
+trades/
 .venv/
 venv/

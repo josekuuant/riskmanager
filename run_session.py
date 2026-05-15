@@ -7,12 +7,14 @@ Uso:
     export ENV_ID=env_...
     export MEMORY_STORE_ID=memstore_...
 
-    python run_session.py <modelo> <ruta-al-csv-de-trades>
+    python run_session.py <modelo> <ruta-al-reporte> [--phase ...] [--size N]
 
-Ejemplo:
-    python run_session.py 2step ./trades/account_98423.xlsx
+Formato del reporte: CSV, XLSX o HTML (MetaTrader 5 ReportHistory).
+<modelo> debe ser uno de: 1step, 2step, instant.
 
-<modelo> debe ser uno de: 1step, 2step, instant
+Ejemplos:
+    python run_session.py instant ./trades/ReportHistory9708.html --size 10000
+    python run_session.py 2step ./trades/cuenta_funded.xlsx --phase funded
 """
 
 import argparse
@@ -36,7 +38,15 @@ def parse_args() -> argparse.Namespace:
         choices=["evaluation", "phase1", "phase2", "funded"],
         help=(
             "Fase de la cuenta. Para 1-step/2-step: evaluation|phase1|phase2|funded. "
-            "Si se omite, el agente la detecta del CSV. instant no usa este flag."
+            "Si se omite, el agente la detecta del reporte. instant no usa este flag."
+        ),
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        help=(
+            "Tamaño de la cuenta (USD). Opcional — si el reporte trae el "
+            "balance inicial, el agente lo usa directamente."
         ),
     )
     parser.add_argument(
@@ -95,9 +105,10 @@ def main() -> None:
     # 3. Stream-first: abrir stream ANTES de enviar el kickoff
     full_response: list[str] = []
     phase_note = f" ({args.phase})" if args.phase else ""
+    size_note = f" de ${args.size:,}" if args.size else ""
     kickoff = (
         f"hello necesito revisar esta cuenta, es {MODEL_LABEL[args.model]} model"
-        f"{phase_note}. Los trades están en /workspace/{args.trades.name}."
+        f"{phase_note}{size_note}. El reporte está en /workspace/{args.trades.name}."
     )
 
     with client.beta.sessions.events.stream(session_id=session.id) as stream:
