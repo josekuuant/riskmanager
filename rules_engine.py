@@ -194,10 +194,35 @@ class Trade:
     commission: float
     swap: float
     profit: float
+    stop_loss: float = 0.0   # 0 = no SL set
+    take_profit: float = 0.0
 
     @property
     def net_pnl(self) -> float:
         return self.profit + self.commission + self.swap
+
+    @property
+    def has_stop_loss(self) -> bool:
+        return self.stop_loss > 0
+
+    def risk_at_stake_usd(self) -> Optional[float]:
+        """Cuánto perdía la posición si el SL se ejecutaba (worst case con SL).
+
+        None si no hay SL definido — significa risk teórico ilimitado.
+        Para buy: (open - SL) × vol × contract_size
+        Para sell: (SL - open) × vol × contract_size
+        """
+        if self.stop_loss <= 0:
+            return None
+        cs = contract_size(self.symbol)
+        if self.side == "buy":
+            distance = self.open_price - self.stop_loss
+        else:
+            distance = self.stop_loss - self.open_price
+        if distance <= 0:
+            # SL "wrong side" — no protege; equivale a no tener SL
+            return None
+        return distance * self.volume * cs
 
 
 @dataclass
@@ -672,15 +697,27 @@ def check_exposure_per_symbol(
     initial_balance: float,
     rules: dict,
 ) -> list[Finding]:
-    """Exposición = margen comprometido simultáneo por símbolo (notional / leverage).
+    """Verifica exposure per symbol con DOS métricas paralelas:
 
-    Interpretación conservadora del 4% rule: margen = notional / max_leverage.
-    Usa max_leverage del modelo (no el leverage real del trader que podría ser
-    menor) — esto es CONSERVADOR para la firma porque asume el peor caso de
-    apalancamiento permitido.
+    1. RISK-AT-STAKE (primaria): suma de (distancia al SL × vol × contract_size)
+       de posiciones simultáneas en el mismo símbolo. Esto es lo que el trader
+       perdería si todos los SL se ejecutaran — la lectura más correcta de
+       "the total risk on a single instrument" según las reglas.
+       - Si una posición NO tiene SL, risk-at-stake es teóricamente ilimitado.
+         Se contabiliza como "unbounded position" y se flagea separadamente.
 
-    Si la firma define "exposure" diferente (ej: risk-at-stake con SL), este
-    cálculo subestima — habría que extender el parser para capturar S/L.
+    2. MARGIN COMMITTED (informativa): notional ÷ max_leverage del modelo.
+       Sirve para evaluar concentración de capital. Útil para pedir reducción
+       de exposición aunque el risk-at-stake esté dentro del límite.
+
+    El motor flagea WARNING si:
+      - risk-at-stake supera el 4% del balance, o
+      - hay posiciones sin SL en exceso del 4% en margin committed, o
+      - el margin committed supera el 4% pero risk-at-stake no (informativo).
+
+    Si todas las posiciones tienen SL y risk-at-stake está dentro del límite,
+    no se flagea ningún warning — incluso si el margin committed es alto
+    (concentración no es lo mismo que riesgo).
     """
     max_pct = rules.get("max_exposure_per_symbol_pct")
     max_lev = rules.get("max_leverage")
@@ -688,55 +725,122 @@ def check_exposure_per_symbol(
         return []
     limit_usd = initial_balance * max_pct / 100
 
-    findings: list[Finding] = []
-    events: list[tuple[datetime, str, float, str]] = []
+    # Para cada símbolo, trackear simultáneamente:
+    #  - risk_at_stake (sumando solo los que tienen SL)
+    #  - margin (todos los notional / leverage)
+    #  - n_unbounded (posiciones sin SL abiertas)
+    events: list[tuple[datetime, str, Trade]] = []
     for t in trades:
-        # Margen = notional / leverage
+        events.append((t.open_time, "open", t))
+        events.append((t.close_time, "close", t))
+    events.sort(key=lambda e: (e[0], 0 if e[1] == "close" else 1))
+    # Procesar closes antes de opens en el mismo timestamp para no contar
+    # de más un trade que cierra y abre simultáneamente.
+
+    risk_by_symbol: dict[str, float] = defaultdict(float)
+    margin_by_symbol: dict[str, float] = defaultdict(float)
+    unbounded_by_symbol: dict[str, int] = defaultdict(int)
+
+    # Picos por símbolo: (timestamp, risk, margin, n_unbounded, n_open)
+    peak_risk: dict[str, tuple[datetime, float, float, int, int]] = {}
+    peak_margin: dict[str, tuple[datetime, float, float, int, int]] = {}
+    n_open_by_symbol: dict[str, int] = defaultdict(int)
+
+    for ts, action, t in events:
+        risk = t.risk_at_stake_usd()
         margin = notional_usd(t.volume, t.open_price, t.symbol) / max_lev
-        events.append((t.open_time, "open", margin, t.symbol))
-        events.append((t.close_time, "close", -margin, t.symbol))
-    events.sort(key=lambda e: e[0])
+        sign = 1 if action == "open" else -1
 
-    open_exp: dict[str, float] = defaultdict(float)
-    worst_per_symbol: dict[str, tuple[datetime, float]] = {}
-    for ts, action, delta, symbol in events:
-        open_exp[symbol] += delta
+        if risk is not None:
+            risk_by_symbol[t.symbol] += sign * risk
+        else:
+            unbounded_by_symbol[t.symbol] += sign
+        margin_by_symbol[t.symbol] += sign * margin
+        n_open_by_symbol[t.symbol] += sign
+
         if action == "open":
-            current = open_exp[symbol]
-            prev = worst_per_symbol.get(symbol, (None, 0.0))[1]
-            if current > prev:
-                worst_per_symbol[symbol] = (ts, current)
+            cur_risk = risk_by_symbol[t.symbol]
+            cur_margin = margin_by_symbol[t.symbol]
+            cur_unbounded = unbounded_by_symbol[t.symbol]
+            cur_n = n_open_by_symbol[t.symbol]
+            snapshot = (ts, cur_risk, cur_margin, cur_unbounded, cur_n)
+            # Track peak risk
+            prev_risk = peak_risk.get(t.symbol, (None, -1, 0, 0, 0))[1]
+            if cur_risk > prev_risk:
+                peak_risk[t.symbol] = snapshot
+            # Track peak margin
+            prev_margin = peak_margin.get(t.symbol, (None, 0, -1, 0, 0))[2]
+            if cur_margin > prev_margin:
+                peak_margin[t.symbol] = snapshot
 
-    for symbol, (ts, peak_exp) in sorted(worst_per_symbol.items()):
-        if peak_exp > limit_usd:
-            cs = contract_size(symbol)
-            # Exposure SIEMPRE es WARNING — la regla del PDF dice "may be
-            # considered violation" + acción típica es "request reduction",
-            # no auto-close. Además, sin S/L data no podemos calcular el
-            # "risk-at-stake" real, que es probablemente la métrica correcta.
-            # El cálculo de margen comprometido es un upper bound conservador.
-            # Para BREACH definitivo: revisión humana con risk-at-stake real
-            # o confirmación del criterio que usa la firma.
-            extreme = peak_exp > limit_usd * 3
-            findings.append(Finding(
-                severity="warning",
-                rule=f"Max Exposure per Symbol ({max_pct}%){'  [EXTREMO]' if extreme else ''}",
-                detail=(
-                    f"Pico de margen comprometido en {symbol}: ${peak_exp:,.2f} "
-                    f"({peak_exp/initial_balance*100:.1f}% del initial) el "
-                    f"{ts:%Y-%m-%d %H:%M}. Límite documentado: ${limit_usd:,.2f} "
-                    f"({max_pct}%). Cálculo: notional (volume × {cs:g} × price) "
-                    f"÷ {max_lev} (max leverage). NOTA: la regla del PDF dice "
-                    "'may be considered violation' y la acción típica es "
-                    "'request reduction', no auto-close. El motor flagea como "
-                    "WARNING — revisión humana decide. Para análisis preciso, "
-                    "extender parser para capturar S/L y calcular risk-at-stake."
-                    + (f" RATIO MUY ALTO ({peak_exp/limit_usd:.1f}× el límite) — revisar." if extreme else "")
-                ),
-                date=ts.date(),
-                actual=peak_exp,
-                limit=limit_usd,
-            ))
+    findings: list[Finding] = []
+    for symbol in sorted(set(peak_risk) | set(peak_margin)):
+        risk_snap = peak_risk.get(symbol)
+        margin_snap = peak_margin.get(symbol)
+        # Peor caso del par: tomamos el peak de cada uno
+        risk_pct = (risk_snap[1] / initial_balance * 100) if risk_snap else 0
+        margin_pct = (margin_snap[2] / initial_balance * 100) if margin_snap else 0
+
+        risk_breach = risk_snap and risk_snap[1] > limit_usd
+        margin_breach = margin_snap and margin_snap[2] > limit_usd
+        has_unbounded = risk_snap and risk_snap[3] > 0
+        also_unbounded_at_margin_peak = margin_snap and margin_snap[3] > 0
+
+        if not (risk_breach or margin_breach or has_unbounded):
+            continue
+
+        # Construir detail line con AMBAS métricas
+        cs = contract_size(symbol)
+        details: list[str] = []
+        if risk_snap:
+            ts_r, r_val, m_at_r, u_at_r, n_at_r = risk_snap
+            details.append(
+                f"Pico RISK-AT-STAKE (SL): ${r_val:,.2f} ({risk_pct:.1f}% del initial) "
+                f"el {ts_r:%Y-%m-%d %H:%M} con {n_at_r} posición(es) abierta(s)"
+                + (f" +{u_at_r} SIN SL (risk ilimitado)" if u_at_r > 0 else "")
+            )
+        if margin_snap:
+            ts_m, r_at_m, m_val, u_at_m, n_at_m = margin_snap
+            details.append(
+                f"Pico MARGIN COMMITTED: ${m_val:,.2f} ({margin_pct:.1f}% del initial) "
+                f"el {ts_m:%Y-%m-%d %H:%M} con {n_at_m} posición(es) "
+                f"(notional ÷ leverage {max_lev})"
+            )
+        details.append(f"Límite documentado (4%): ${limit_usd:,.2f}")
+        details.append(f"Contract size para {symbol}: {cs:g}")
+
+        # Decidir severidad y mensaje
+        if risk_breach:
+            rule_suffix = " — RISK"
+            extra = (
+                "BLOQUEA payout si la firma interpreta exposure como "
+                "risk-at-stake (interpretación más estricta y conservadora)."
+            )
+        elif has_unbounded:
+            rule_suffix = " — SIN SL"
+            extra = (
+                "Hay trades simultáneos sin stop-loss → riesgo teórico "
+                "ILIMITADO. Decisión humana requerida."
+            )
+        else:
+            rule_suffix = " — MARGEN"
+            extra = (
+                "Risk-at-stake dentro del límite, pero alta concentración "
+                "de capital. Acción típica: 'request reduction of exposure'. "
+                "NO bloquea payout."
+            )
+
+        findings.append(Finding(
+            severity="warning",
+            rule=f"Max Exposure per Symbol ({max_pct}%){rule_suffix}",
+            detail=" | ".join(details) + " — " + extra,
+            date=(risk_snap or margin_snap)[0].date(),
+            actual=max(
+                risk_snap[1] if risk_snap else 0,
+                margin_snap[2] if margin_snap else 0,
+            ),
+            limit=limit_usd,
+        ))
     return findings
 
 

@@ -82,6 +82,14 @@ def parse(html: str) -> tuple[float, list[Trade], dict[str, str]]:
                 try:
                     open_time = datetime.strptime(cells[0], "%Y.%m.%d %H:%M:%S")
                     close_time = datetime.strptime(cells[9], "%Y.%m.%d %H:%M:%S")
+                    # S/L y T/P pueden estar vacíos ('') o '0' cuando no se setearon
+                    def _opt(s: str) -> float:
+                        if not s or s.strip() in {"", "0", "0.00"}:
+                            return 0.0
+                        try:
+                            return parse_number(s)
+                        except ValueError:
+                            return 0.0
                     trades.append(Trade(
                         open_time=open_time,
                         close_time=close_time,
@@ -89,6 +97,8 @@ def parse(html: str) -> tuple[float, list[Trade], dict[str, str]]:
                         side=cells[3].lower(),
                         volume=parse_number(cells[5]),
                         open_price=parse_number(cells[6]),
+                        stop_loss=_opt(cells[7]),
+                        take_profit=_opt(cells[8]),
                         close_price=parse_number(cells[10]),
                         commission=parse_number(cells[11]),
                         swap=parse_number(cells[12]),
