@@ -47,6 +47,54 @@ Model = Literal["instant", "1step", "2step"]
 Phase = Literal["evaluation", "phase1", "phase2", "funded"]
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Contract sizes por instrumento — para calcular notional REAL
+# Interpretación conservadora: cualquier símbolo no listado asume forex 100K.
+# Las reglas hablan de "exposure" sin definir notional vs margin — tomamos
+# NOTIONAL (el monto bruto comprometido) por ser MÁS RESTRICTIVO.
+# ────────────────────────────────────────────────────────────────────────────
+
+CONTRACT_SIZE: dict[str, float] = {
+    # Metales (1 lot = 100 oz para oro, 5000 oz para plata)
+    "XAUUSD": 100, "XAUEUR": 100, "XAUGBP": 100, "XAUAUD": 100,
+    "XAGUSD": 5000, "XAGEUR": 5000,
+    "XPTUSD": 100, "XPDUSD": 100,
+    # Crypto (1 lot = 1 unidad típicamente; algunos brokers usan 0.01 o 1.0)
+    "BTCUSD": 1, "ETHUSD": 1, "XRPUSD": 1, "LTCUSD": 1, "BCHUSD": 1,
+    "ADAUSD": 1, "SOLUSD": 1, "DOGEUSD": 1, "DOTUSD": 1, "AVAXUSD": 1,
+    # Energías
+    "USOIL": 1000, "UKOIL": 1000, "WTIUSD": 1000, "BCOUSD": 1000,
+    "XNGUSD": 10000, "NGAS": 10000,
+    # Índices — varía mucho por broker; default conservador
+    "US30": 1, "US100": 1, "SPX500": 1, "NAS100": 1, "GER40": 1, "UK100": 1,
+    "JPN225": 1, "FRA40": 1, "AUS200": 1, "HK50": 1,
+    # Default forex (100,000) — aplicado abajo en lookup
+}
+FOREX_CONTRACT_SIZE = 100_000
+
+
+def contract_size(symbol: str) -> float:
+    """Devuelve contract size. Para forex desconocido asume 100,000.
+
+    Conservador: prefiere sobreestimar exposure (más fácil flaggear breach).
+    """
+    if symbol in CONTRACT_SIZE:
+        return CONTRACT_SIZE[symbol]
+    # Heurística: si parece forex (6 letras, ej EURUSD, AUDJPY) → 100K
+    if len(symbol) == 6 and symbol.isalpha():
+        return FOREX_CONTRACT_SIZE
+    # Default conservador
+    return FOREX_CONTRACT_SIZE
+
+
+def notional_usd(volume: float, price: float, symbol: str) -> float:
+    """Notional en USD aproximado. NO ajusta por currency-cross — para pares
+    donde USD no es la quote currency, el notional es en la quote currency,
+    pero como aproximación USD ≈ es razonable salvo para pares exóticos.
+    """
+    return volume * contract_size(symbol) * price
+
+
 RULES = {
     # Instant: trailing daily + trailing overall, sin evaluation
     ("instant", None): {
@@ -110,6 +158,7 @@ RULES = {
         "max_risk_per_idea_pct": 3.0,
         "max_exposure_per_symbol_pct": 4.0,
         "trade_idea_window_minutes": 5,
+        "max_leverage": 30,
         "news_trading_allowed": False,
     },
     # 2-step funded (live): daily 5%, max loss 10% fixed. News NOT allowed.
@@ -122,6 +171,7 @@ RULES = {
         "max_risk_per_idea_pct": 3.0,
         "max_exposure_per_symbol_pct": 4.0,
         "trade_idea_window_minutes": 5,
+        "max_leverage": 100,
         "news_trading_allowed": False,
     },
 }
@@ -356,15 +406,18 @@ def check_daily_loss(
                 actual=worst_dd,
                 limit=limit_pct,
             ))
-        elif worst_dd >= limit_pct - 1.0:
+        elif worst_dd >= limit_pct - 0.5:
+            # Threshold conservador: warning si quedó dentro de 0.5pp del
+            # límite. El equity intraday con floating P&L pudo haber cruzado.
             kind = "trailing" if is_trailing else "fixed"
             findings.append(Finding(
                 severity="warning",
                 rule=f"Max Daily Loss {limit_pct}% ({kind}) — NEAR LIMIT",
                 detail=(
                     f"El {d.trading_day}: peor DD intraday {worst_dd:.2f}% "
-                    f"({kind}), a menos de 1pp del límite {limit_pct}%. "
-                    "Con equity intraday (floating P&L) el límite pudo haberse cruzado."
+                    f"({kind}), a menos de 0.5pp del límite {limit_pct}%. "
+                    "Con equity intraday (floating P&L) el límite pudo haberse cruzado. "
+                    "Sugiere revisión manual con data tick."
                 ),
                 date=d.trading_day,
                 actual=worst_dd,
@@ -375,9 +428,14 @@ def check_daily_loss(
 
 def check_max_loss(
     daily: list[DailyStats],
+    trades_by_day: dict[date, list[Trade]],
     initial_balance: float,
     rules: dict,
 ) -> list[Finding]:
+    """Verifica max loss (total). En FIXED chequea contra el peor balance
+    intraday, no solo el cierre del día — más restrictivo. En TRAILING usa
+    peak + factor del balance al cierre (best we can with closed trades).
+    """
     findings: list[Finding] = []
     dd_type = rules.get("drawdown_type")
     dd_pct = rules.get("drawdown_pct", 0)
@@ -386,50 +444,75 @@ def check_max_loss(
 
     if dd_type == "fixed":
         limit_balance = initial_balance * (1 - dd_pct / 100)
+        # Chequear balance INTRADAY mínimo, no solo al cierre
         for d in daily:
-            if d.close_balance <= limit_balance:
+            running = d.open_balance
+            worst_intraday = d.open_balance
+            worst_at: Trade | None = None
+            for t in trades_by_day.get(d.trading_day, []):
+                running += t.net_pnl
+                if running < worst_intraday:
+                    worst_intraday = running
+                    worst_at = t
+            if worst_intraday <= limit_balance:
+                when = (
+                    f"tras el trade cerrado a las {worst_at.close_time:%H:%M:%S}"
+                    if worst_at else "durante el día"
+                )
                 findings.append(Finding(
                     severity="breach",
                     rule=f"Max Loss {dd_pct}% (fixed)",
                     detail=(
-                        f"El día {d.trading_day} el balance cerró en "
-                        f"${d.close_balance:,.2f}, por debajo del piso fijo "
-                        f"${limit_balance:,.2f} ({dd_pct}% del initial)."
+                        f"El {d.trading_day} {when} el balance llegó a "
+                        f"${worst_intraday:,.2f}, por debajo del piso fijo "
+                        f"${limit_balance:,.2f} ({dd_pct}% del initial "
+                        f"${initial_balance:,.2f})."
                     ),
                     date=d.trading_day,
-                    actual=d.close_balance,
+                    actual=worst_intraday,
                     limit=limit_balance,
                 ))
                 break
+
     elif dd_type == "trailing":
+        # Trailing: chequear contra peak intraday y running balance
+        peak = initial_balance
         for d in daily:
-            if d.close_balance < d.trailing_dd_limit:
-                findings.append(Finding(
-                    severity="breach",
-                    rule=f"Max Trailing Loss {dd_pct}%",
-                    detail=(
-                        f"El día {d.trading_day} el balance cerró en "
-                        f"${d.close_balance:,.2f}, por debajo del trailing "
-                        f"${d.trailing_dd_limit:,.2f} "
-                        f"(peak ${d.running_peak:,.2f} × {1-dd_pct/100:.2f})."
-                    ),
-                    date=d.trading_day,
-                    actual=d.close_balance,
-                    limit=d.trailing_dd_limit,
-                ))
-                break
-        # Buffer warning: si quedaste muy cerca del trailing al final
-        if daily and not any(f.rule.startswith("Max Trailing") for f in findings):
+            running = d.open_balance
+            for t in trades_by_day.get(d.trading_day, []):
+                running += t.net_pnl
+                peak = max(peak, running)
+                floor = peak * (1 - dd_pct / 100)
+                if running < floor:
+                    findings.append(Finding(
+                        severity="breach",
+                        rule=f"Max Trailing Loss {dd_pct}%",
+                        detail=(
+                            f"El {d.trading_day} tras el trade cerrado a las "
+                            f"{t.close_time:%H:%M:%S} el balance cayó a "
+                            f"${running:,.2f}, por debajo del trailing "
+                            f"${floor:,.2f} (peak ${peak:,.2f} × "
+                            f"{1-dd_pct/100:.2f})."
+                        ),
+                        date=d.trading_day,
+                        actual=running,
+                        limit=floor,
+                    ))
+                    return findings  # primer breach trailing es terminal
+
+        # Buffer warning: si terminó muy cerca del trailing
+        if daily:
             last = daily[-1]
-            buffer_pct = (last.close_balance - last.trailing_dd_limit) / last.running_peak * 100
+            final_floor = last.running_peak * (1 - dd_pct / 100)
+            buffer_pct = (last.close_balance - final_floor) / last.running_peak * 100
             if buffer_pct < 1.0:
                 findings.append(Finding(
                     severity="warning",
                     rule=f"Max Trailing Loss {dd_pct}% (NEAR LIMIT)",
                     detail=(
-                        f"Buffer al trailing actual: {buffer_pct:.2f}% del peak. "
-                        f"Equity ${last.close_balance:,.2f} vs trailing "
-                        f"${last.trailing_dd_limit:,.2f}."
+                        f"Buffer al trailing al final del período: {buffer_pct:.2f}% "
+                        f"del peak. Balance ${last.close_balance:,.2f} vs trailing "
+                        f"${final_floor:,.2f} (peak ${last.running_peak:,.2f})."
                     ),
                 ))
     return findings
@@ -471,25 +554,37 @@ def check_profit_target(
 
 
 def check_min_trading_days(
-    daily: list[DailyStats],
+    trades: list[Trade],
     rules: dict,
+    server_utc_offset_hours: int,
 ) -> list[Finding]:
+    """Min trading days = cantidad de trading days con AL MENOS UN TRADE
+    ABIERTO (no necesariamente cerrado). Las reglas dicen: 'A trading day
+    is counted whenever at least one trade is opened.'
+    """
     min_days = rules.get("min_trading_days")
     if min_days is None:
         return []
-    if len(daily) >= min_days:
+    days_with_open = set(
+        trading_day(t.open_time, server_utc_offset_hours) for t in trades
+    )
+    n = len(days_with_open)
+    if n >= min_days:
         return [Finding(
             severity="info",
             rule=f"Min Trading Days ({min_days})",
-            detail=f"{len(daily)} trading days con actividad (cumple mínimo {min_days}).",
-            actual=len(daily),
+            detail=f"{n} trading days con al menos un trade abierto (cumple mínimo {min_days}).",
+            actual=n,
             limit=min_days,
         )]
     return [Finding(
         severity="warning",
         rule=f"Min Trading Days ({min_days})",
-        detail=f"Solo {len(daily)} trading days con actividad — requiere {min_days}.",
-        actual=len(daily),
+        detail=(
+            f"Solo {n} trading days con al menos un trade abierto — "
+            f"requiere {min_days}. Bloquea aprobación de la fase."
+        ),
+        actual=n,
         limit=min_days,
     )]
 
@@ -575,46 +670,55 @@ def check_exposure_per_symbol(
     initial_balance: float,
     rules: dict,
 ) -> list[Finding]:
-    """Exposición = suma de volume×close_price por símbolo en cualquier momento simultáneo.
+    """Exposición = margen comprometido simultáneo por símbolo (notional / leverage).
 
-    Aproximación simple: para cada apertura, calcular cuánta exposición había
-    abierta por símbolo en ese momento (trades que aún no se cerraron).
+    Interpretación conservadora del 4% rule: margen = notional / max_leverage.
+    Usa max_leverage del modelo (no el leverage real del trader que podría ser
+    menor) — esto es CONSERVADOR para la firma porque asume el peor caso de
+    apalancamiento permitido.
+
+    Si la firma define "exposure" diferente (ej: risk-at-stake con SL), este
+    cálculo subestima — habría que extender el parser para capturar S/L.
     """
     max_pct = rules.get("max_exposure_per_symbol_pct")
-    if max_pct is None:
+    max_lev = rules.get("max_leverage")
+    if max_pct is None or not max_lev:
         return []
     limit_usd = initial_balance * max_pct / 100
 
-    # Para cada trade, calcular cuánto del mismo símbolo estaba abierto en su open_time
     findings: list[Finding] = []
-    by_symbol: dict[str, float] = defaultdict(float)
-    worst_per_symbol: dict[str, tuple[datetime, float]] = {}
-
-    # Eventos: open (+exposure), close (-exposure), ordenados temporalmente
-    events: list[tuple[datetime, str, float, str]] = []  # (time, action, exposure_usd, symbol)
+    events: list[tuple[datetime, str, float, str]] = []
     for t in trades:
-        exp = t.volume * t.open_price
-        events.append((t.open_time, "open", exp, t.symbol))
-        events.append((t.close_time, "close", -exp, t.symbol))
+        # Margen = notional / leverage
+        margin = notional_usd(t.volume, t.open_price, t.symbol) / max_lev
+        events.append((t.open_time, "open", margin, t.symbol))
+        events.append((t.close_time, "close", -margin, t.symbol))
     events.sort(key=lambda e: e[0])
 
     open_exp: dict[str, float] = defaultdict(float)
+    worst_per_symbol: dict[str, tuple[datetime, float]] = {}
     for ts, action, delta, symbol in events:
         open_exp[symbol] += delta
         if action == "open":
-            if open_exp[symbol] > worst_per_symbol.get(symbol, (None, 0))[1]:
-                worst_per_symbol[symbol] = (ts, open_exp[symbol])
+            current = open_exp[symbol]
+            prev = worst_per_symbol.get(symbol, (None, 0.0))[1]
+            if current > prev:
+                worst_per_symbol[symbol] = (ts, current)
 
-    for symbol, (ts, peak_exp) in worst_per_symbol.items():
+    for symbol, (ts, peak_exp) in sorted(worst_per_symbol.items()):
         if peak_exp > limit_usd:
+            cs = contract_size(symbol)
+            severity = "breach" if peak_exp > limit_usd * 1.5 else "warning"
             findings.append(Finding(
-                severity="warning",
+                severity=severity,
                 rule=f"Max Exposure per Symbol ({max_pct}%)",
                 detail=(
-                    f"Pico de exposición en {symbol}: ${peak_exp:,.2f} el "
-                    f"{ts:%Y-%m-%d %H:%M} — excede ${limit_usd:,.2f} ({max_pct}% "
-                    f"del initial ${initial_balance:,.2f}). NOTA: cálculo en USD "
-                    "notional con precio de apertura — no incluye apalancamiento."
+                    f"Pico de margen comprometido en {symbol}: ${peak_exp:,.2f} "
+                    f"el {ts:%Y-%m-%d %H:%M} — excede ${limit_usd:,.2f} ({max_pct}% "
+                    f"del initial ${initial_balance:,.2f}). Cálculo: notional "
+                    f"(volume × {cs:g} × price) ÷ {max_lev} (max leverage del modelo). "
+                    "Si la firma usa otra métrica (notional bruto, risk-at-stake "
+                    "con SL), ajustar interpretación."
                 ),
                 date=ts.date(),
                 actual=peak_exp,
@@ -706,9 +810,9 @@ def evaluate(
 
     findings: list[Finding] = []
     findings += check_daily_loss(daily, by_day, rules)
-    findings += check_max_loss(daily, initial_balance, rules)
+    findings += check_max_loss(daily, by_day, initial_balance, rules)
     findings += check_profit_target(daily, initial_balance, rules)
-    findings += check_min_trading_days(daily, rules)
+    findings += check_min_trading_days(trades, rules, server_utc_offset_hours)
     findings += check_consistency_15(daily, rules)
     findings += check_min_profitable_days(daily, initial_balance, rules)
     findings += check_exposure_per_symbol(trades, initial_balance, rules)
