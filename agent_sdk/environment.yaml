@@ -1,0 +1,19 @@
+# environment.yaml — Managed Agents environment for the Risk Manager.
+#
+# Apply once:
+#   ENV_ID=$(ant beta:environments create < environment.yaml --transform id -r)
+#   echo "Environment created: $ENV_ID"
+#
+# The Risk Manager is a one-shot, structured-output agent — it never
+# executes shell commands, never reads files, never browses the web. The
+# environment exists only because Managed Agents requires one; networking
+# is restricted to nothing so the container can't be misused even if the
+# system prompt is somehow bypassed.
+
+name: nys-risk-manager-env
+description: Sandbox for the NYS Risk Manager. No tool execution expected — agent only emits a custom-tool call.
+config:
+  type: cloud
+  networking:
+    type: package_managers_and_custom
+    allowed_hosts: []

@@ -1,0 +1,130 @@
+# agent.yaml — NYS Risk Manager Managed Agent definition
+#
+# Apply with the Anthropic CLI (one-time setup):
+#   AGENT_ID=$(ant beta:agents create < agent.yaml --transform id -r)
+#   echo "Agent created: $AGENT_ID"
+#
+# To update an existing agent (creates a new version):
+#   ant beta:agents update --agent-id "$AGENT_ID" --version <N> < agent.yaml
+#
+# Environment is separate — see environment.yaml.
+#
+# The agent declares ONE custom tool: submit_audit_result. The system prompt
+# forces every response to be a call to that tool. The session client
+# captures the agent.custom_tool_use event and treats its input as the
+# audit output, then sends a trivial user.custom_tool_result to let the
+# session terminate cleanly.
+#
+# Why a custom tool (not the agent_toolset_20260401)?
+#   - Custom tool calls fire as agent.custom_tool_use events, which the
+#     client receives directly on the SSE stream — perfect for capturing
+#     structured output.
+#   - No bash / file ops / web search needed for a one-shot audit.
+#   - The model's tool call IS the deliverable.
+
+name: NYS Risk Manager
+model: claude-opus-4-7
+description: >
+  Senior NYS Markets Risk & Compliance Analyst. Audits a trader's
+  MetaTrader account for payout eligibility against the firm's program
+  rulebook. Every response is a structured submit_audit_result tool call —
+  no prose, no chitchat.
+
+# The full SYSTEM_PROMPT from riskmanager/api.py belongs here as a YAML
+# block-literal string. Loading it from a file keeps this manifest readable;
+# see scripts/build_agent_yaml.py for a one-liner that splices it in.
+system: |
+  # SYSTEM_PROMPT placeholder.
+  # Replace this block with the contents of riskmanager/api.py SYSTEM_PROMPT
+  # (use scripts/build_agent_yaml.py to splice it in automatically).
+
+tools:
+  - type: custom
+    name: submit_audit_result
+    description: Submit the structured payout audit result. Every audit MUST end with exactly one call to this tool.
+    input_schema:
+      type: object
+      properties:
+        finalDecision:
+          type: string
+          enum: [PASSED, WARNING, BREACH, MANUAL_REVIEW]
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        executiveSummary:
+          type: string
+        confirmedBreaches:
+          type: array
+          items: { $ref: "#/$defs/ruleAnalysis" }
+        estimatedBreaches:
+          type: array
+          items: { $ref: "#/$defs/ruleAnalysis" }
+        warnings:
+          type: array
+          items: { $ref: "#/$defs/ruleAnalysis" }
+        notEnoughData:
+          type: array
+          items: { $ref: "#/$defs/ruleAnalysis" }
+        ruleByRuleAnalysis:
+          type: array
+          items: { $ref: "#/$defs/ruleAnalysis" }
+        evidenceTable:
+          type: array
+          items:
+            type: object
+            properties:
+              ticket: { type: string }
+              symbol: { type: string }
+              time: { type: string }
+              observation: { type: string }
+              ruleRef: { type: string }
+            required: [observation, ruleRef]
+        internalRecommendation:
+          type: string
+          enum: ["APPROVE PAYOUT", "REJECT PAYOUT", "PARTIAL APPROVAL", "MANUAL REVIEW REQUIRED"]
+        emailSubject: { type: string }
+        emailBody: { type: string }
+        humanReportMarkdown: { type: string }
+        # Plus the extended fields from api.py:
+        #   tradeIdeaGroups, dailyAnalysis, prohibitedPolicyReview,
+        #   accountSummaryExtras, resolvedRulebook
+        # Add them here if you want the agent to be free to emit them.
+      required:
+        - finalDecision
+        - severity
+        - executiveSummary
+        - confirmedBreaches
+        - estimatedBreaches
+        - warnings
+        - notEnoughData
+        - ruleByRuleAnalysis
+        - evidenceTable
+        - internalRecommendation
+        - emailSubject
+        - emailBody
+      $defs:
+        ruleAnalysis:
+          type: object
+          properties:
+            rule: { type: string }
+            status:
+              type: string
+              enum: [PASSED, WARNING, BREACH, MANUAL_REVIEW, NOT_ENOUGH_DATA]
+            severity:
+              type: string
+              enum: [LOW, MEDIUM, HIGH, CRITICAL]
+            dataQuality:
+              type: string
+              enum: [CONFIRMED, ESTIMATED, NOT_ENOUGH_DATA]
+            explanation: { type: string }
+            calculation: { type: string }
+            relatedTickets:
+              type: array
+              items: { type: string }
+            allowed: { type: string }
+            actual: { type: string }
+          required: [rule, status, severity, dataQuality, explanation]
+
+metadata:
+  source: riskmanager
+  version: "3.4.0"
