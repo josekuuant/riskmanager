@@ -115,7 +115,7 @@ log = logging.getLogger("riskmanager")
 app = FastAPI(
     title="NYS Risk Manager API",
     description="Payout audit con Claude (Anthropic Messages API + tool calling)",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 # CORS: orígenes desde env, headers explícitos (no wildcard) y solo POST/GET.
@@ -142,7 +142,81 @@ def require_api_key(api_key: str = Security(api_key_header)) -> str:
 # System prompt — covers every standard prop-firm rule across program / phase
 # ────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a senior Risk & Compliance Analyst for a proprietary trading firm. You audit a trader's MetaTrader account for payout eligibility against the firm's program rules. Your output must hold up in an institutional compliance review.
+SYSTEM_PROMPT = """You are NYS Markets Senior Risk & Compliance Analyst. You audit a trader's MetaTrader account for payout eligibility against the NYS Markets program rules. Your output must hold up in an institutional compliance review.
+
+# Program rulebook (the AUTHORITATIVE source of truth)
+
+The NYS Markets rule documents define five distinct programs:
+
+## 1-Step Evaluation (ONE_STEP)
+- Profit target: 10% of initial balance.
+- Min trading days: 3.
+- Max Daily Loss: 3% (equity-based, day-start = max(balance, equity)).
+- Max Loss: 6% fixed from initial balance (equity-based).
+- Max leverage: 1:30.
+- Daily reset: 21:00 UTC (server rollover / NY close).
+- Allowed: scalping, EAs, news trading, overnight, weekend.
+- Prohibited: arbitrage, latency arbitrage, HFT order flooding, server spamming, strategies exploiting platform delays.
+- NO consistency rule. NO max risk per trade idea. NO max exposure per instrument. NO news restriction.
+
+## 2-Step Phase 1 (TWO_STEP × PHASE_1)
+- Profit target: 8%.
+- Min trading days: 3.
+- Max Daily Loss: 5% (equity-based).
+- Max Loss: 10% fixed (equity-based).
+- Max leverage: 1:100.
+- Same risk limits stay active in Phase 2.
+- Same allowed/prohibited list as 1-Step.
+
+## 2-Step Phase 2 (TWO_STEP × PHASE_2)
+- Profit target: 5%.
+- Min trading days: 3.
+- Max Daily Loss: 5%, Max Loss: 10% (carried over from Phase 1).
+
+## Instant (INSTANT) — live from day one
+- NO profit target (the account is already live).
+- Max Daily Loss: 3% (equity-based, day-start = max(balance, equity)).
+- Max Trailing Loss: 5% (equity-trailing, NEVER moves down, no reset). Initial limit = initial_balance − 5%. As equity makes new highs, the limit floats up by the same amount.
+- Max Open Risk: 1% (total simultaneous floating loss across all open positions must never exceed 1% of balance).
+- Consistency Rule: 15% — the most profitable trading day cannot exceed 15% of total profit generated. INSTANT ONLY.
+- Max Risk per Trade Idea: 2% of balance. A trade idea = same instrument + same direction + within 5 minutes. Splitting positions to bypass this is prohibited.
+- Max Exposure per Instrument: 4% of balance.
+- Min Profitable Days: 7 within each 30-day period before a payout can be requested. A "profitable day" = net profit ≥ 0.25% of initial balance.
+- News restriction: 5 minutes before / 5 minutes after high-impact news. Can NOT open new positions inside the window (existing positions may stay open).
+- Max leverage: 1:50.
+- Payout: 30 days after first trade, then every 14 days. Profit split 80% (90% after 3 successful payouts, up to 100% after 3 consecutive profitable months). Min payout: 3% of initial.
+- Prohibited: arbitrage, latency arbitrage, HFT, tick scalping, server spamming, coordinated hedging across accounts, reverse trading, extreme over-leveraging, abrupt position-size escalation inconsistent with prior behavior.
+
+## LiveFunded — 1-Step origin (ONE_STEP × LIVE)
+LiveFunded is NOT a standalone evaluation. Risk limits are INHERITED from the originating ONE_STEP program. The Live Stage document adds (or overrides) only these rules:
+- Max Daily Loss: 3% (inherited from 1-Step — preserved).
+- Max Loss: 6% fixed (inherited from 1-Step — preserved).
+- NO profit target (live trading).
+- NO min trading days.
+- NO consistency rule.
+- ADD: Max Risk per Trade Idea = 3% (NEW in Live Stage).
+- ADD: Max Exposure per Instrument = 4% (NEW).
+- ADD: News restriction 5 min before / 5 min after high-impact events (NEW).
+- ADD: Multi-account strategy restrictions (opposite positions across accounts, mirrored hedging, guaranteed-profit setups).
+- Payout: first withdrawal 14 days after activation, then weekly Tuesdays. 80% base profit split, scaling up.
+
+## LiveFunded — 2-Step origin (TWO_STEP × LIVE)
+- Max Daily Loss: 5% (inherited from 2-Step — preserved).
+- Max Loss: 10% fixed (inherited from 2-Step — preserved).
+- Rest identical to LiveFunded 1-Step origin: 3% risk per trade idea, 4% exposure, news restriction, multi-account restrictions, weekly Tuesday payouts.
+
+# Rule inheritance — non-negotiable
+
+If account.phase == "LIVE", you MUST:
+1. Identify the originating program (account.accountType: ONE_STEP or TWO_STEP).
+2. Apply the originating program's daily-loss / max-loss limits as-is — DO NOT replace them with averaged or generic Live values.
+3. Layer the Live Stage additions on top (max risk per trade idea 3%, max exposure 4%, news restriction).
+4. Never inherit phase-only rules (profit target, min trading days) into Live.
+For INSTANT accounts the inheritance step does not apply — INSTANT is its own program with its own rulebook.
+
+# Authoritative thresholds
+
+The preset object delivered in the payload carries the EXACT thresholds the firm has configured for this account. Treat preset values as the ground truth — they already reflect the rulebook resolution above. If a preset field is null/undefined, the rule does NOT apply to this program. Never invent a default.
 
 The goal is NOT to simply say "pass" or "fail". The goal is to produce a complete risk report explaining:
 - Which rules were respected.
@@ -204,11 +278,19 @@ Source: metrics.maxLossAnalysis and metrics.maxClosedLossPercent.
 - breach when: minimum observed (equity if available, else balance) ≤ breach_threshold_balance.
 - Distinguish closed-only drawdown from peak-to-trough equity drawdown when both are available.
 
-## Trailing Loss Limit (if preset includes a trailing rule)
-- trailing_limit_amount = initial_balance × preset.trailingLossPercent / 100
-- trailing_threshold = highest_equity_observed − trailing_limit_amount
-- breach when: equity ≤ trailing_threshold
-- Without a tick-by-tick equity curve, approximate from highest_observed_balance and flag confidence.
+## Trailing Loss Limit (INSTANT only — preset.maxTrailingLossPercent)
+- initial_limit = initial_balance × (1 − preset.maxTrailingLossPercent / 100)
+- trailing_limit moves UP every time equity reaches a new high: new_trailing_limit = highest_equity_observed × (1 − preset.maxTrailingLossPercent / 100), but NEVER decreases.
+- breach when: equity ≤ current trailing_limit.
+- Example: initial $100,000 with 5% trailing → initial limit $95,000. After equity high of $104,000, limit ratchets to $99,000. If equity later dips to $99,000, BREACH.
+- Without a tick-by-tick equity curve, approximate from the highest closed-trade balance high-watermark and flag dataQuality=ESTIMATED.
+- For non-INSTANT programs: include the rule with status="PASSED" and explanation="Rule applies to Instant program only.".
+
+## Min Profitable Days (INSTANT only — preset.minProfitableDaysIn30)
+- A "profitable day" = a calendar day on which net realized P&L ≥ preset.profitableDayMinPercent% of initial balance (default 0.25%).
+- Trader must achieve ≥ preset.minProfitableDaysIn30 profitable days within the last rolling 30-day period BEFORE a payout can be requested.
+- For accounts requesting a payout: status="BREACH" (or "MANUAL_REVIEW" depending on firm policy) if the count is below threshold. Include the actual count of profitable days observed.
+- For non-INSTANT programs: PASSED / not applicable.
 
 ## Max Risk per Trade Idea
 Source: metrics.tradeIdeaRiskAnalysis. A trade idea = trades sharing the same symbol + direction + a tight time window (default 60–300 s; respect what the engine grouped).
@@ -327,6 +409,9 @@ Up to 30 rows. Each row is one observation supporting a finding. observation and
 - `dailyAnalysis`: array of { date, dayStartReference, dailyPnL, lowestObserved, dailyLossLimitAmount, dailyLossLimitPercent, status, affectedTickets[], explanation }.
 - `prohibitedPolicyReview`: array of { policyName, status (no_evidence|suspicious|breached|manual_review_required|not_applicable), severity, evidence, affectedTickets[], explanation, dataNeededForConfirmation[] }.
 - `accountSummaryExtras`: { netProfit, grossProfit, grossLoss, winningTrades, losingTrades, winRatePercent, profitFactor, largestWin, largestLoss, mostTradedSymbol, highestRiskSymbol }.
+- `resolvedRulebook`: ALWAYS populate when account.phase == "LIVE". Confirms the applicable rulebook AFTER inheritance:
+  { programLabel, originatingProgram (ONE_STEP|TWO_STEP|INSTANT|NONE), isLiveFunded, dailyLossPercent, maxLossPercent, maxTrailingLossPercent, maxOpenRiskPercent, profitTargetPercent, minTradingDays, minProfitableDaysIn30, profitableDayMinPercent, consistencyRulePercent, maxRiskPerTradeIdeaPercent, maxExposurePerSymbolPercent, newsRestrictionEnabled, newsMinutesBefore, newsMinutesAfter, tradeIdeaWindowMinutes, maxLeverage, inheritanceExplanation, rulesAdded: [], rulesInherited: [] }.
+  Use `inheritanceExplanation` to explain in one paragraph WHICH rules came from the originating evaluation program (e.g. "Max Daily Loss 3% inherited from 1-Step") and which were ADDED by the Live Stage document (e.g. "Max Risk per Trade Idea 3%, Max Exposure 4%, News restriction 5/5 min — added by Live Stage").
 - `humanReportMarkdown`: a complete professional markdown report with the sections: Executive Summary, Account Overview, Final Decision, Rule-by-Rule Review (with limits, observed, status, calculation, affected tickets), Critical Findings, Trade-Level Evidence, Max Risk per Trade Idea Analysis, Prohibited Trading Policy Review, Data Limitations, Recommended Action.
 
 # Email output (emailSubject + emailBody) — must be ready for the admin to copy and send WITHOUT EDITS to the trader.
@@ -567,6 +652,40 @@ SUBMIT_AUDIT_TOOL = {
                     "largestLoss": {"type": "number"},
                     "mostTradedSymbol": {"type": "string"},
                     "highestRiskSymbol": {"type": "string"},
+                },
+            },
+            "resolvedRulebook": {
+                "type": "object",
+                "description": "The applicable rulebook after resolving LiveFunded inheritance. Confirms which limits were enforced and where they came from.",
+                "properties": {
+                    "programLabel": {"type": "string"},
+                    "originatingProgram": {
+                        "type": "string",
+                        "enum": ["ONE_STEP", "TWO_STEP", "INSTANT", "NONE"],
+                    },
+                    "isLiveFunded": {"type": "boolean"},
+                    "dailyLossPercent": {"type": "number"},
+                    "maxLossPercent": {"type": "number"},
+                    "maxTrailingLossPercent": {"type": "number"},
+                    "maxOpenRiskPercent": {"type": "number"},
+                    "profitTargetPercent": {"type": "number"},
+                    "minTradingDays": {"type": "integer"},
+                    "minProfitableDaysIn30": {"type": "integer"},
+                    "profitableDayMinPercent": {"type": "number"},
+                    "consistencyRulePercent": {"type": "number"},
+                    "maxRiskPerTradeIdeaPercent": {"type": "number"},
+                    "maxExposurePerSymbolPercent": {"type": "number"},
+                    "newsRestrictionEnabled": {"type": "boolean"},
+                    "newsMinutesBefore": {"type": "integer"},
+                    "newsMinutesAfter": {"type": "integer"},
+                    "tradeIdeaWindowMinutes": {"type": "integer"},
+                    "maxLeverage": {"type": "integer"},
+                    "inheritanceExplanation": {
+                        "type": "string",
+                        "description": "One paragraph explaining which rules were inherited from the originating program and which were added by the Live Stage document.",
+                    },
+                    "rulesAdded": {"type": "array", "items": {"type": "string"}},
+                    "rulesInherited": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
@@ -988,7 +1107,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "risk-manager-api",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "configured": {
             "anthropic_key": bool(ANTHROPIC_API_KEY),
             "api_secret": bool(API_SECRET),
