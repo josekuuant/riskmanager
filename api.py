@@ -103,6 +103,9 @@ MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "12000"))
 ANTHROPIC_TIMEOUT_SECONDS = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "120"))
 ANTHROPIC_MAX_RETRIES = int(os.environ.get("ANTHROPIC_MAX_RETRIES", "3"))
 
+APIFY_API_KEY = os.environ.get("APIFY_API_KEY", "")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
+
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.environ.get(
@@ -1161,6 +1164,122 @@ def run_audit(req: AuditRequest) -> dict:
     }
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# External data helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+
+async def get_economic_events(
+    from_date: str,
+    to_date: str,
+    countries: Optional[list[str]] = None,
+    importances: Optional[list[str]] = None,
+) -> list[dict]:
+    """Fetch economic calendar events from Apify (pintostudio actor).
+
+    Args:
+        from_date: Start date in "YYYY-MM-DD" format (e.g. "2026-05-09").
+        to_date:   End date in "YYYY-MM-DD" format (e.g. "2026-05-16").
+        countries: List of country codes to filter by (e.g. ["US", "EU"]).
+                   Defaults to ["US"] when not provided.
+        importances: List of importance levels (e.g. ["high", "medium"]).
+                     Defaults to ["high", "medium"] when not provided.
+
+    Returns:
+        List of economic event dicts returned by the actor dataset.
+
+    Raises:
+        HTTPException 502 if Apify returns a non-2xx response.
+        HTTPException 503 if APIFY_API_KEY is not configured.
+    """
+    if not APIFY_API_KEY:
+        raise HTTPException(503, "APIFY_API_KEY not configured on server")
+
+    if countries is None:
+        countries = ["US"]
+    if importances is None:
+        importances = ["high", "medium"]
+
+    url = (
+        "https://api.apify.com/v2/acts/"
+        "pintostudio~economic-calendar-data-investing-com/"
+        "run-sync-get-dataset-items"
+    )
+    params = {"token": APIFY_API_KEY}
+    payload = {
+        "from_date": from_date,
+        "to_date": to_date,
+        "countries": countries,
+        "importances": importances,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, params=params, json=payload)
+    except httpx.RequestError as exc:
+        log.error("Apify connection error: %s", exc)
+        raise HTTPException(502, "Could not reach Apify economic calendar service.")
+
+    if resp.status_code != 200:
+        log.error(
+            "Apify returned %d: %s", resp.status_code, resp.text[:500]
+        )
+        raise HTTPException(
+            502,
+            f"Apify economic calendar returned {resp.status_code}. "
+            "Check actor name and API key.",
+        )
+
+    try:
+        return resp.json()
+    except Exception:
+        log.error("Apify response is not valid JSON: %s", resp.text[:500])
+        raise HTTPException(502, "Apify returned an invalid response.")
+
+
+async def get_price_data(symbol: str) -> dict:
+    """Fetch latest quote data for a symbol from Massive API.
+
+    Args:
+        symbol: Instrument symbol (e.g. "EURUSD", "AAPL").
+
+    Returns:
+        Quote dict returned by Massive API.
+
+    Raises:
+        HTTPException 502 if Massive API returns a non-2xx response.
+        HTTPException 503 if MASSIVE_API_KEY is not configured.
+    """
+    if not MASSIVE_API_KEY:
+        raise HTTPException(503, "MASSIVE_API_KEY not configured on server")
+
+    url = f"https://api.massiveapi.com/v1/quotes/{symbol}"
+    headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.RequestError as exc:
+        log.error("Massive API connection error: %s", exc)
+        raise HTTPException(502, "Could not reach Massive API price service.")
+
+    if resp.status_code != 200:
+        log.error(
+            "Massive API returned %d for symbol %s: %s",
+            resp.status_code,
+            symbol,
+            resp.text[:500],
+        )
+        raise HTTPException(
+            502,
+            f"Massive API returned {resp.status_code} for symbol '{symbol}'.",
+        )
+
+    try:
+        return resp.json()
+    except Exception:
+        log.error("Massive API response is not valid JSON: %s", resp.text[:500])
+        raise HTTPException(502, "Massive API returned an invalid response.")
 
 
 # ────────────────────────────────────────────────────────────────────────────
