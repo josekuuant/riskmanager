@@ -51,6 +51,7 @@ Contract (compatible con riskmanager.functions.ts del frontend):
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -73,6 +74,7 @@ from pydantic import BaseModel, Field
 API_SECRET = os.environ.get("API_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")
+APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
 # Mock / synthetic responses are deliberately NOT supported. Every audit is
 # a real Anthropic call. If ANTHROPIC_API_KEY is missing or the call fails,
 # run_audit raises 503 / 502 / 504 with an explicit error — never a fake
@@ -1164,6 +1166,132 @@ def run_audit(req: AuditRequest) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# External data helpers — Apify actors
+# ────────────────────────────────────────────────────────────────────────────
+
+_APIFY_BASE = "https://api.apify.com/v2"
+_APIFY_ACTOR_ECON = "pintostudio~economic-calendar-data-investing-com"
+_APIFY_ACTOR_PRICE = "apify~yahoo-finance-scraper"
+
+# Apify run-sync timeout: 60 s connect, 120 s read (actors can be slow to cold-start)
+_APIFY_TIMEOUT = httpx.Timeout(120.0, connect=60.0)
+
+
+def get_economic_events(
+    from_date: str,
+    to_date: str,
+    countries: list[str] | None = None,
+    importances: list[str] | None = None,
+) -> list[dict]:
+    """Fetch economic calendar events from Apify (investing.com scraper).
+
+    Args:
+        from_date: Start date in YYYY-MM-DD format.
+        to_date:   End date in YYYY-MM-DD format.
+        countries: Optional list of country codes to filter (e.g. ["US", "EU"]).
+        importances: Optional list of importance levels (e.g. ["high", "medium"]).
+
+    Returns:
+        List of event dicts from the actor dataset.
+
+    Raises:
+        HTTPException 503 if APIFY_API_TOKEN is not configured.
+        HTTPException 502 if the Apify actor call fails or times out.
+    """
+    if not APIFY_API_TOKEN:
+        raise HTTPException(503, "APIFY_API_TOKEN not configured on server")
+
+    input_payload: dict[str, Any] = {
+        "fromDate": from_date,
+        "toDate": to_date,
+    }
+    if countries:
+        input_payload["countries"] = countries
+    if importances:
+        input_payload["importances"] = importances
+
+    url = f"{_APIFY_BASE}/acts/{_APIFY_ACTOR_ECON}/run-sync-get-dataset-items"
+    params = {"token": APIFY_API_TOKEN}
+
+    try:
+        with httpx.Client(timeout=_APIFY_TIMEOUT) as client:
+            resp = client.post(url, params=params, json=input_payload)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            log.warning("Apify economic calendar returned non-list: %s", type(data))
+            return []
+        return data
+    except httpx.TimeoutException:
+        log.exception("Apify economic calendar actor timed out")
+        raise HTTPException(502, "Economic calendar service timed out. Try again shortly.")
+    except httpx.HTTPStatusError as e:
+        log.exception(
+            "Apify economic calendar actor HTTP error: status=%s", e.response.status_code
+        )
+        raise HTTPException(
+            502,
+            f"Economic calendar service returned an error ({e.response.status_code}). "
+            "Try again shortly.",
+        )
+    except Exception:
+        log.exception("Unexpected error calling Apify economic calendar actor")
+        raise HTTPException(502, "Economic calendar service unavailable. Try again shortly.")
+
+
+def get_price_data(symbol: str) -> dict:
+    """Fetch latest quote data for a single symbol from Apify (Yahoo Finance scraper).
+
+    Args:
+        symbol: Ticker symbol (e.g. "EURUSD=X", "AAPL", "GC=F").
+
+    Returns:
+        Dict with quote fields (price, change, changePercent, etc.) or an empty
+        dict if the actor returns no results for the symbol.
+
+    Raises:
+        HTTPException 503 if APIFY_API_TOKEN is not configured.
+        HTTPException 502 if the Apify actor call fails or times out.
+    """
+    if not APIFY_API_TOKEN:
+        raise HTTPException(503, "APIFY_API_TOKEN not configured on server")
+
+    input_payload: dict[str, Any] = {
+        "symbols": [symbol],
+        "proxy": {"useApifyProxy": True},
+    }
+
+    url = f"{_APIFY_BASE}/acts/{_APIFY_ACTOR_PRICE}/run-sync-get-dataset-items"
+    params = {"token": APIFY_API_TOKEN}
+
+    try:
+        with httpx.Client(timeout=_APIFY_TIMEOUT) as client:
+            resp = client.post(url, params=params, json=input_payload)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0]
+        return {}
+    except httpx.TimeoutException:
+        log.exception("Apify price data actor timed out for symbol=%s", symbol)
+        raise HTTPException(502, f"Price data service timed out for {symbol}. Try again shortly.")
+    except httpx.HTTPStatusError as e:
+        log.exception(
+            "Apify price data actor HTTP error: symbol=%s status=%s",
+            symbol,
+            e.response.status_code,
+        )
+        raise HTTPException(
+            502,
+            f"Price data service returned an error ({e.response.status_code}) "
+            f"for {symbol}. Try again shortly.",
+        )
+    except Exception:
+        log.exception("Unexpected error calling Apify price data actor for symbol=%s", symbol)
+        raise HTTPException(502, f"Price data service unavailable for {symbol}. Try again shortly.")
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1202,6 +1330,80 @@ def full(req: AuditRequest) -> dict:
 @app.post("/narrate", dependencies=[Depends(require_api_key)])
 def narrate(req: AuditRequest) -> dict:
     return run_audit(req)
+
+
+class AuditHtmlRequest(BaseModel):
+    """Request body for /audit-html.
+
+    symbols: list of ticker symbols to fetch price data for (e.g. ["EURUSD=X", "GC=F"]).
+    countries: optional country filter for the economic calendar (e.g. ["US", "EU"]).
+    importances: optional importance filter (e.g. ["high", "medium", "low"]).
+    """
+
+    symbols: list[str] = Field(default_factory=list)
+    countries: list[str] | None = None
+    importances: list[str] | None = None
+
+    class Config:
+        extra = "allow"
+
+
+@app.post("/audit-html", dependencies=[Depends(require_api_key)])
+def audit_html(req: AuditHtmlRequest) -> dict:
+    """Return market context data: price quotes + economic calendar events.
+
+    Fetches:
+    - Economic calendar events for a ±7-day window around today via Apify
+      (pintostudio~economic-calendar-data-investing-com).
+    - Price quote for each requested symbol via Apify (Yahoo Finance scraper).
+
+    Errors from individual price lookups are captured per-symbol and returned
+    in the response rather than aborting the whole request, so a single bad
+    ticker does not block the calendar data.
+    """
+    today = datetime.date.today()
+    from_date = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    to_date = (today + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # ── Economic calendar ────────────────────────────────────────────────────
+    try:
+        economic_events = get_economic_events(
+            from_date=from_date,
+            to_date=to_date,
+            countries=req.countries,
+            importances=req.importances,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("Unexpected error fetching economic events in /audit-html")
+        raise HTTPException(502, "Failed to fetch economic calendar data.")
+
+    # ── Price data — one call per symbol, errors captured individually ───────
+    price_data: dict[str, Any] = {}
+    price_errors: dict[str, str] = {}
+
+    for symbol in req.symbols:
+        try:
+            quote = get_price_data(symbol)
+            price_data[symbol] = quote
+        except HTTPException as exc:
+            log.warning(
+                "Price data fetch failed for symbol=%s: %s", symbol, exc.detail
+            )
+            price_errors[symbol] = exc.detail
+        except Exception:
+            log.exception("Unexpected error fetching price data for symbol=%s", symbol)
+            price_errors[symbol] = f"Unexpected error fetching price data for {symbol}"
+
+    return {
+        "ok": True,
+        "from_date": from_date,
+        "to_date": to_date,
+        "economic_events": economic_events,
+        "price_data": price_data,
+        **({"price_errors": price_errors} if price_errors else {}),
+    }
 
 
 # Body size cap — reject oversized payloads before parsing.
