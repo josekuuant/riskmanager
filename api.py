@@ -51,16 +51,19 @@ Contract (compatible con riskmanager.functions.ts del frontend):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import random
 import time
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import anthropic
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from bs4 import BeautifulSoup
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
@@ -73,6 +76,12 @@ from pydantic import BaseModel, Field
 API_SECRET = os.environ.get("API_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")
+
+# External APIs
+APIFY_API_KEY = os.environ.get("APIFY_API_KEY", "")
+APIFY_ECONOMIC_CALENDAR_TOKEN = os.environ.get("APIFY_ECONOMIC_CALENDAR_TOKEN", "")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
+
 # Mock / synthetic responses are deliberately NOT supported. Every audit is
 # a real Anthropic call. If ANTHROPIC_API_KEY is missing or the call fails,
 # run_audit raises 503 / 502 / 504 with an explicit error — never a fake
@@ -1164,8 +1173,206 @@ def run_audit(req: AuditRequest) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# External data helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+
+async def get_economic_events() -> dict:
+    """Fetch economic calendar events from Apify and filter for US high/medium impact."""
+    try:
+        now = datetime.utcnow()
+        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        date_to = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+
+        url = "https://api.apify.com/v2/acts/apify~economic-calendar-scraper/run-sync-get-dataset-items"
+        params = {
+            "token": APIFY_ECONOMIC_CALENDAR_TOKEN,
+        }
+        payload = {
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "currencies": ["USD"],
+            "importance": ["high", "medium"],
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, params=params, json=payload)
+            resp.raise_for_status()
+            events = resp.json()
+
+        return {
+            "events": events,
+            "fetched_at": now.isoformat() + "Z",
+            "date_from": date_from,
+            "date_to": date_to,
+            "count": len(events),
+            "error": None,
+        }
+    except Exception as exc:
+        log.warning("get_economic_events failed: %s", exc)
+        return {
+            "events": [],
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+            "count": 0,
+            "error": str(exc),
+        }
+
+
+async def get_price_data(symbols: list[str]) -> dict:
+    """Fetch real-time and historical price data from Massive API for each symbol."""
+    if not symbols:
+        return {}
+
+    async def fetch_symbol(symbol: str) -> tuple[str, Any]:
+        try:
+            url = f"https://api.massiveapi.com/v1/quotes/{symbol}"
+            headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                return symbol, resp.json()
+        except Exception as exc:
+            log.warning("get_price_data failed for %s: %s", symbol, exc)
+            return symbol, {"error": str(exc)}
+
+    results = await asyncio.gather(*[fetch_symbol(s) for s in symbols])
+    return dict(results)
+
+
+def parse_mt_html(content: bytes) -> dict:
+    """Parse an MT4/MT5 HTML statement and extract account info and trades."""
+    try:
+        soup = BeautifulSoup(content, "html.parser")
+
+        # Extract account info from the statement header
+        account_info: dict[str, Any] = {}
+        for row in soup.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                label = cells[0].get_text(strip=True).lower()
+                value = cells[1].get_text(strip=True)
+                if "account" in label and "number" in label:
+                    account_info["account_number"] = value
+                elif label in ("balance:", "balance"):
+                    account_info["balance"] = value
+                elif label in ("equity:", "equity"):
+                    account_info["equity"] = value
+                elif "name" in label:
+                    account_info["name"] = value
+                elif "currency" in label:
+                    account_info["currency"] = value
+                elif "leverage" in label:
+                    account_info["leverage"] = value
+
+        # Extract trades from the main trades table
+        trades: list[dict] = []
+        tables = soup.find_all("table")
+        for table in tables:
+            headers_row = table.find("tr")
+            if not headers_row:
+                continue
+            headers = [th.get_text(strip=True).lower() for th in headers_row.find_all(["th", "td"])]
+
+            # Detect a trades table by looking for key column names
+            if not any(h in headers for h in ("ticket", "order", "#")):
+                continue
+
+            for row in table.find_all("tr")[1:]:
+                cells = row.find_all("td")
+                if not cells:
+                    continue
+                row_data = [c.get_text(strip=True) for c in cells]
+                if len(row_data) < len(headers):
+                    continue
+                trade = dict(zip(headers, row_data))
+                # Skip summary / deposit / withdrawal rows
+                trade_type = trade.get("type", trade.get("action", "")).lower()
+                if trade_type in ("balance", "credit", "deposit", "withdrawal", ""):
+                    continue
+                trades.append(trade)
+
+        return {
+            "account_info": account_info,
+            "trades": trades,
+            "trade_count": len(trades),
+            "error": None,
+        }
+    except Exception as exc:
+        log.warning("parse_mt_html failed: %s", exc)
+        return {
+            "account_info": {},
+            "trades": [],
+            "trade_count": 0,
+            "error": str(exc),
+        }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────────────────────────────────
+
+
+@app.post("/audit-html", dependencies=[Depends(require_api_key)])
+async def audit_html(file: UploadFile = File(...)) -> dict:
+    """Accept an MT4/MT5 HTML statement upload and return an enriched audit response."""
+    t_start = time.time()
+
+    content = await file.read()
+    parsed = parse_mt_html(content)
+
+    # Extract unique symbols from trades
+    symbols: list[str] = list(
+        {
+            t.get("symbol", t.get("item", "")).strip().upper()
+            for t in parsed["trades"]
+            if t.get("symbol", t.get("item", "")).strip()
+        }
+    )
+
+    # Fetch price data and economic events concurrently
+    t_enrich_start = time.time()
+    price_data, economic_events = await asyncio.gather(
+        get_price_data(symbols),
+        get_economic_events(),
+    )
+    enrich_latency_ms = int((time.time() - t_enrich_start) * 1000)
+
+    total_latency_ms = int((time.time() - t_start) * 1000)
+
+    # Basic audit summary derived from parsed trades
+    profits = []
+    for t in parsed["trades"]:
+        raw = t.get("profit", t.get("p/l", t.get("pnl", "")))
+        try:
+            profits.append(float(str(raw).replace(",", "").replace(" ", "")))
+        except (ValueError, TypeError):
+            pass
+
+    net_pnl = round(sum(profits), 2) if profits else None
+    winning_trades = sum(1 for p in profits if p > 0)
+    losing_trades = sum(1 for p in profits if p < 0)
+
+    audit_summary = {
+        "trade_count": parsed["trade_count"],
+        "symbols_found": symbols,
+        "net_pnl": net_pnl,
+        "winning_trades": winning_trades,
+        "losing_trades": losing_trades,
+        "parse_error": parsed["error"],
+    }
+
+    return {
+        "ok": True,
+        "account_info": parsed["account_info"],
+        "trades": parsed["trades"],
+        "price_data": price_data,
+        "economic_events": economic_events,
+        "audit_summary": audit_summary,
+        "latency": {
+            "total_ms": total_latency_ms,
+            "enrichment_ms": enrich_latency_ms,
+        },
+    }
 
 
 @app.get("/health")
