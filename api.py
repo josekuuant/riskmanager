@@ -73,6 +73,33 @@ from pydantic import BaseModel, Field
 API_SECRET = os.environ.get("API_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "anthropic")  # "anthropic" | "mock"
+# Production-safe mock mode. Off by default. When on, run_audit returns a
+# sentinel response WITHOUT calling Anthropic, so the frontend can render a
+# "Mock AI mode active" warning. NEVER leave this on in production.
+MOCK_AI = os.environ.get("MOCK_AI", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# ─── Anthropic pricing (USD per million tokens) — keep aligned with the
+# Anthropic published rate card. cache reads are charged at a discount.
+ANTHROPIC_PRICES_PER_M = {
+    "claude-opus-4-7": {"in": 5.0, "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-sonnet-4-6": {"in": 3.0, "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-haiku-4-5": {"in": 1.0, "out": 5.0, "cache_read": 0.10, "cache_write": 1.25},
+}
+
+
+def _estimate_cost_usd(model: str, usage: dict) -> float:
+    """Best-effort cost estimate from token usage. Returns 0 if model unknown."""
+    rates = ANTHROPIC_PRICES_PER_M.get(model)
+    if not rates:
+        return 0.0
+    cost = (
+        usage.get("input_tokens", 0) * rates["in"]
+        + usage.get("output_tokens", 0) * rates["out"]
+        + usage.get("cache_read_input_tokens", 0) * rates["cache_read"]
+        + usage.get("cache_creation_input_tokens", 0) * rates["cache_write"]
+    ) / 1_000_000.0
+    return round(cost, 6)
 MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "12000"))
 ANTHROPIC_TIMEOUT_SECONDS = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "120"))
 ANTHROPIC_MAX_RETRIES = int(os.environ.get("ANTHROPIC_MAX_RETRIES", "3"))
@@ -115,7 +142,7 @@ log = logging.getLogger("riskmanager")
 app = FastAPI(
     title="NYS Risk Manager API",
     description="Payout audit con Claude (Anthropic Messages API + tool calling)",
-    version="3.2.0",
+    version="3.3.0",
 )
 
 # CORS: orígenes desde env, headers explícitos (no wildcard) y solo POST/GET.
@@ -972,6 +999,13 @@ def validate_audit_output(data: dict) -> Optional[str]:
 
 def run_audit(req: AuditRequest) -> dict:
     """Llama a Claude con el contexto, fuerza tool call, retorna structured output."""
+    # Mock mode — short-circuit before any Anthropic call. Used in CI / local
+    # development. NEVER leave MOCK_AI=true in production: the frontend
+    # renders a big red banner whenever the response carries ai.mock=true.
+    if MOCK_AI or AI_PROVIDER == "mock":
+        log.warning("AI_CALL mock provider=mock model=mock (MOCK_AI=%s)", MOCK_AI)
+        return _mock_audit_response(req)
+
     if not ANTHROPIC_API_KEY:
         raise HTTPException(503, "ANTHROPIC_API_KEY not configured on server")
 
@@ -1078,22 +1112,99 @@ def run_audit(req: AuditRequest) -> dict:
             502, f"Risk Manager produced an invalid audit payload: {err}"
         )
 
+    usage = {
+        "input_tokens": getattr(message.usage, "input_tokens", 0),
+        "output_tokens": getattr(message.usage, "output_tokens", 0),
+        "cache_creation_input_tokens": getattr(
+            message.usage, "cache_creation_input_tokens", 0
+        ),
+        "cache_read_input_tokens": getattr(
+            message.usage, "cache_read_input_tokens", 0
+        ),
+    }
+    cost_usd = _estimate_cost_usd(MODEL, usage)
+    response_id = getattr(message, "id", None)
+    generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    log.info(
+        "AI_CALL ok provider=anthropic model=%s response_id=%s latency_ms=%d "
+        "input=%d output=%d cache_read=%d cache_write=%d cost_usd=%.6f",
+        MODEL,
+        response_id,
+        latency_ms,
+        usage["input_tokens"],
+        usage["output_tokens"],
+        usage["cache_read_input_tokens"],
+        usage["cache_creation_input_tokens"],
+        cost_usd,
+    )
+
     return {
         "ok": True,
         "data": audit,
+        "ai": {
+            "ai_status": "ok",
+            "provider": "anthropic",
+            "model": MODEL,
+            "response_id": response_id,
+            "generated_at": generated_at,
+            "latency_ms": latency_ms,
+            "usage": usage,
+            "cost_usd_estimate": cost_usd,
+            "fallback_used": False,
+            "mock": False,
+        },
+        # Legacy fields preserved for backward compatibility with older
+        # frontend clients still reading res.data.{model,usage,latencyMs}.
         "latencyMs": latency_ms,
         "model": MODEL,
-        "usage": {
-            "input_tokens": getattr(message.usage, "input_tokens", 0),
-            "output_tokens": getattr(message.usage, "output_tokens", 0),
-            "cache_creation_input_tokens": getattr(
-                message.usage, "cache_creation_input_tokens", 0
-            ),
-            "cache_read_input_tokens": getattr(
-                message.usage, "cache_read_input_tokens", 0
-            ),
-        },
+        "usage": usage,
         "trades_dropped": dropped,
+    }
+
+
+def _mock_audit_response(req: AuditRequest) -> dict:
+    """Synthetic response used when MOCK_AI=true. NEVER use in production."""
+    audit = {
+        "finalDecision": "MANUAL_REVIEW",
+        "severity": "LOW",
+        "executiveSummary": (
+            "MOCK MODE: this review was NOT generated by the Claude API. "
+            "Set MOCK_AI=false on the Risk Manager backend to run a real audit."
+        ),
+        "confirmedBreaches": [],
+        "estimatedBreaches": [],
+        "warnings": [],
+        "notEnoughData": [],
+        "ruleByRuleAnalysis": [],
+        "evidenceTable": [],
+        "internalRecommendation": "MANUAL REVIEW REQUIRED",
+        "emailSubject": "Payout Review — Mock mode active",
+        "emailBody": (
+            "This is a mock response generated locally for development. "
+            "Set MOCK_AI=false on the Risk Manager backend to run a real audit."
+        ),
+    }
+    return {
+        "ok": True,
+        "data": audit,
+        "ai": {
+            "ai_status": "mock",
+            "provider": "mock",
+            "model": "mock",
+            "response_id": None,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "latency_ms": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "cost_usd_estimate": 0.0,
+            "fallback_used": False,
+            "mock": True,
+            "warning": "MOCK_AI mode is active on the agent. Set MOCK_AI=false in production.",
+        },
+        "latencyMs": 0,
+        "model": "mock",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "trades_dropped": 0,
     }
 
 
@@ -1107,11 +1218,13 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "risk-manager-api",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "configured": {
             "anthropic_key": bool(ANTHROPIC_API_KEY),
             "api_secret": bool(API_SECRET),
             "model": MODEL,
+            "ai_provider": AI_PROVIDER,
+            "mock_ai": MOCK_AI,
         },
     }
 
