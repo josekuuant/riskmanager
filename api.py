@@ -51,16 +51,19 @@ Contract (compatible con riskmanager.functions.ts del frontend):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import random
 import time
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import anthropic
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from bs4 import BeautifulSoup
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
@@ -73,6 +76,11 @@ from pydantic import BaseModel, Field
 API_SECRET = os.environ.get("API_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")
+
+# External APIs
+APIFY_API_KEY = os.environ.get("APIFY_API_KEY", "")
+APIFY_ECONOMIC_CALENDAR_TOKEN = os.environ.get("APIFY_ECONOMIC_CALENDAR_TOKEN", "")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 # Mock / synthetic responses are deliberately NOT supported. Every audit is
 # a real Anthropic call. If ANTHROPIC_API_KEY is missing or the call fails,
 # run_audit raises 503 / 502 / 504 with an explicit error — never a fake
@@ -1164,6 +1172,245 @@ def run_audit(req: AuditRequest) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# External data helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+
+async def get_economic_events(symbols: list[str]) -> dict:
+    """Fetch economic calendar events from Apify for the last 7 and next 7 days.
+
+    Filters for US events with high or medium importance. Returns a dict with
+    an ``events`` list and ``source`` metadata. Errors are caught and logged so
+    they never block the main audit response.
+    """
+    if not APIFY_API_KEY or not APIFY_ECONOMIC_CALENDAR_TOKEN:
+        log.info("Apify credentials not configured — skipping economic events fetch")
+        return {"events": [], "source": "apify", "error": "credentials_not_configured"}
+
+    now = datetime.utcnow()
+    date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    date_to = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    url = (
+        f"https://api.apify.com/v2/acts/{APIFY_ECONOMIC_CALENDAR_TOKEN}/runs/last/dataset/items"
+        f"?token={APIFY_API_KEY}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params={"dateFrom": date_from, "dateTo": date_to})
+            resp.raise_for_status()
+            raw_events: list[dict] = resp.json()
+
+        filtered = [
+            e for e in raw_events
+            if (
+                e.get("country", "").upper() == "US"
+                and e.get("importance", "").upper() in ("HIGH", "MEDIUM")
+            )
+        ]
+
+        log.info(
+            "Economic events fetched: %d total, %d US high/medium after filter",
+            len(raw_events),
+            len(filtered),
+        )
+        return {
+            "events": filtered,
+            "source": "apify",
+            "date_from": date_from,
+            "date_to": date_to,
+            "total_fetched": len(raw_events),
+        }
+    except Exception:
+        log.exception("Failed to fetch economic events from Apify")
+        return {"events": [], "source": "apify", "error": "fetch_failed"}
+
+
+async def get_price_data(symbols: list[str]) -> dict:
+    """Fetch real-time and historical price data from Massive API for each symbol.
+
+    Processes symbols concurrently and returns a mapping of symbol -> price data.
+    Per-symbol errors are caught individually so a single bad symbol never
+    fails the entire request.
+    """
+    if not MASSIVE_API_KEY:
+        log.info("MASSIVE_API_KEY not configured — skipping price data fetch")
+        return {"error": "credentials_not_configured"}
+
+    if not symbols:
+        return {}
+
+    results: dict[str, Any] = {}
+
+    async with httpx.AsyncClient(
+        timeout=10.0,
+        headers={"Authorization": f"Bearer {MASSIVE_API_KEY}"},
+    ) as client:
+        async def _fetch_symbol(symbol: str) -> None:
+            try:
+                # Real-time quote
+                rt_resp = await client.get(
+                    "https://api.massiveapi.com/v1/quotes",
+                    params={"symbol": symbol},
+                )
+                rt_resp.raise_for_status()
+                rt_data = rt_resp.json()
+
+                # Historical OHLCV (last 30 days, daily)
+                hist_from = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+                hist_resp = await client.get(
+                    "https://api.massiveapi.com/v1/historical",
+                    params={"symbol": symbol, "from": hist_from, "interval": "1d"},
+                )
+                hist_resp.raise_for_status()
+                hist_data = hist_resp.json()
+
+                results[symbol] = {
+                    "realtime": rt_data,
+                    "historical": hist_data,
+                }
+                log.info("Price data fetched for symbol: %s", symbol)
+            except Exception:
+                log.exception("Failed to fetch price data for symbol: %s", symbol)
+                results[symbol] = {"error": "fetch_failed"}
+
+        await asyncio.gather(*[_fetch_symbol(s) for s in symbols])
+
+    return results
+
+
+def parse_mt_html(html_content: str) -> dict:
+    """Parse an MT4/MT5 HTML statement and extract account info and trades.
+
+    Uses BeautifulSoup to locate the account summary and the closed-trades
+    table. Returns a dict with ``account_info`` and ``trades`` keys. Parsing
+    errors are caught and surfaced in the returned dict rather than raised, so
+    callers can decide how to handle partial data.
+    """
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+    except Exception:
+        log.exception("BeautifulSoup failed to parse HTML")
+        return {"account_info": {}, "trades": [], "parse_error": "html_parse_failed"}
+
+    account_info: dict[str, Any] = {}
+    trades: list[dict[str, Any]] = []
+
+    # ── Account summary ──────────────────────────────────────────────────────
+    # MT4/MT5 statements embed account details in a table near the top of the
+    # document. We look for cells whose text contains known labels.
+    try:
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                for i, cell in enumerate(cells):
+                    cell_lower = cell.lower()
+                    if "account" in cell_lower and i + 1 < len(cells):
+                        account_info.setdefault("accountNumber", cells[i + 1])
+                    elif "balance" in cell_lower and i + 1 < len(cells):
+                        account_info.setdefault("balance", cells[i + 1])
+                    elif "equity" in cell_lower and i + 1 < len(cells):
+                        account_info.setdefault("equity", cells[i + 1])
+                    elif "name" in cell_lower and i + 1 < len(cells):
+                        account_info.setdefault("name", cells[i + 1])
+    except Exception:
+        log.exception("Error extracting account info from MT HTML")
+
+    # ── Trades table ─────────────────────────────────────────────────────────
+    # MT4/MT5 statements list closed trades in a table whose header row
+    # contains columns like Ticket, Open Time, Type, Size/Volume, Symbol,
+    # Price (open), S/L, T/P, Close Time, Price (close), Commission, Swap,
+    # Profit. Column order varies slightly between MT4 and MT5 exports.
+    TRADE_COLUMN_ALIASES: dict[str, str] = {
+        "ticket": "ticket",
+        "order": "ticket",
+        "open time": "openTime",
+        "opentime": "openTime",
+        "type": "type",
+        "size": "volume",
+        "volume": "volume",
+        "lots": "volume",
+        "item": "symbol",
+        "symbol": "symbol",
+        "price": "openPrice",
+        "open price": "openPrice",
+        "s/l": "stopLoss",
+        "sl": "stopLoss",
+        "stop loss": "stopLoss",
+        "t/p": "takeProfit",
+        "tp": "takeProfit",
+        "take profit": "takeProfit",
+        "close time": "closeTime",
+        "closetime": "closeTime",
+        "close price": "closePrice",
+        "commission": "commission",
+        "swap": "swap",
+        "profit": "profit",
+        "taxes": "taxes",
+    }
+
+    try:
+        for table in soup.find_all("table"):
+            headers_row = table.find("tr")
+            if headers_row is None:
+                continue
+
+            raw_headers = [
+                th.get_text(strip=True).lower()
+                for th in headers_row.find_all(["th", "td"])
+            ]
+
+            # Identify this as a trades table by requiring at least "ticket"
+            # (or "order") and "profit" columns.
+            col_map: dict[int, str] = {}
+            for idx, raw_h in enumerate(raw_headers):
+                canonical = TRADE_COLUMN_ALIASES.get(raw_h)
+                if canonical:
+                    col_map[idx] = canonical
+
+            canonical_names = set(col_map.values())
+            if "ticket" not in canonical_names or "profit" not in canonical_names:
+                continue
+
+            # Parse each data row.
+            for row in table.find_all("tr")[1:]:
+                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                if not cells:
+                    continue
+
+                trade: dict[str, Any] = {}
+                for idx, field_name in col_map.items():
+                    if idx < len(cells):
+                        trade[field_name] = cells[idx]
+
+                # Skip summary / balance / deposit rows that lack a numeric ticket.
+                ticket_val = trade.get("ticket", "")
+                if not ticket_val or not any(ch.isdigit() for ch in str(ticket_val)):
+                    continue
+
+                # Skip non-trade rows (balance, credit, etc.) identified by type.
+                trade_type = trade.get("type", "").lower()
+                if trade_type in ("balance", "credit", "deposit", "withdrawal", ""):
+                    continue
+
+                trades.append(trade)
+
+            # Stop after the first valid trades table.
+            if trades:
+                break
+    except Exception:
+        log.exception("Error extracting trades from MT HTML")
+
+    log.info(
+        "MT HTML parsed: account_info keys=%s, trades=%d",
+        list(account_info.keys()),
+        len(trades),
+    )
+    return {"account_info": account_info, "trades": trades}
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1202,6 +1449,95 @@ def full(req: AuditRequest) -> dict:
 @app.post("/narrate", dependencies=[Depends(require_api_key)])
 def narrate(req: AuditRequest) -> dict:
     return run_audit(req)
+
+
+@app.post("/audit-html", dependencies=[Depends(require_api_key)])
+async def audit_html(file: UploadFile = File(...)) -> dict:
+    """Accept an MT4/MT5 HTML statement, parse it, and enrich with market data.
+
+    Workflow:
+      1. Read and parse the uploaded HTML file.
+      2. Extract unique symbols from the parsed trades.
+      3. Fetch price data (Massive API) and economic events (Apify) in parallel.
+      4. Return the enriched payload — ready for a subsequent /audit call or
+         for direct consumption by the frontend.
+
+    Authentication: X-API-Key header (same secret as all other endpoints).
+    Content-Type: multipart/form-data with a single ``file`` field.
+    """
+
+
+    started = time.time()
+
+    # ── Read uploaded file ────────────────────────────────────────────────────
+
+    try:
+        raw_bytes = await file.read()
+        html_content = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        log.exception("Failed to read uploaded HTML file")
+        raise HTTPException(400, "Could not read uploaded file. Ensure it is a valid HTML file.")
+
+    if not html_content.strip():
+        raise HTTPException(400, "Uploaded file is empty.")
+
+    # ── Parse MT HTML ─────────────────────────────────────────────────────────
+    parsed = parse_mt_html(html_content)
+    trades: list[dict[str, Any]] = parsed.get("trades", [])
+    account_info: dict[str, Any] = parsed.get("account_info", {})
+
+    if parsed.get("parse_error"):
+        log.warning("MT HTML parse error: %s", parsed["parse_error"])
+
+    # ── Extract unique symbols ────────────────────────────────────────────────
+    symbols: list[str] = list(
+        {str(t["symbol"]) for t in trades if t.get("symbol")}
+    )
+
+    # ── Parallel enrichment ───────────────────────────────────────────────────
+    price_task = asyncio.create_task(get_price_data(symbols))
+    events_task = asyncio.create_task(get_economic_events(symbols))
+    price_data, economic_events = await asyncio.gather(price_task, events_task)
+
+    latency_ms = int((time.time() - started) * 1000)
+
+    # ── Basic audit summary ───────────────────────────────────────────────────
+    total_profit = 0.0
+    for t in trades:
+        try:
+            total_profit += float(str(t.get("profit", "0")).replace(",", "") or 0)
+        except (ValueError, TypeError):
+            pass
+
+    audit_summary = {
+        "tradesFound": len(trades),
+        "symbolsFound": symbols,
+        "totalProfit": round(total_profit, 2),
+        "parseWarning": parsed.get("parse_error"),
+        "note": (
+            "Basic summary only. Submit trades to /audit with a full preset "
+            "and metrics payload for a complete compliance audit."
+        ),
+    }
+
+    log.info(
+        "audit-html ok trades=%d symbols=%d latency_ms=%d",
+        len(trades),
+        len(symbols),
+        latency_ms,
+    )
+
+    return {
+        "ok": True,
+        "data": {
+            "accountInfo": account_info,
+            "trades": trades,
+            "priceData": price_data,
+            "economicEvents": economic_events,
+            "auditSummary": audit_summary,
+        },
+        "latencyMs": latency_ms,
+    }
 
 
 # Body size cap — reject oversized payloads before parsing.
